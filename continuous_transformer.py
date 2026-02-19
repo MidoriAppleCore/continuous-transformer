@@ -121,6 +121,27 @@ def hippo_freqs(dim: int) -> torch.Tensor:
     return torch.exp(-freqs * np.log(10_000))
 
 
+def hippo_b_vector(dim: int) -> torch.Tensor:
+    """
+    HiPPO-LegS input coupling vector: b_n = sqrt(2n+1).
+
+    This is the EXACT same (2n+1)^0.5 that initialises omega — that's not
+    a coincidence.  In the diagonalised HiPPO-LegS system, A's eigenvalues
+    have imaginary parts proportional to sqrt(2n+1), and B_n = sqrt(2n+1).
+    They are mathematically coupled: the optimal input coupling and the
+    optimal rotation frequency are the same function of polynomial order n.
+
+    Low-order modes (n≈0):  small b_n → slow, memory-holding modes
+    High-order modes (n≈D): large b_n → fast, input-sensitive modes
+
+    Normalised to max=1 so high-order modes get full coupling (≡1) and
+    low-order modes are proportionally weaker but longer-lived.
+    """
+    n = torch.arange(dim, dtype=torch.float32)
+    b = (2 * n + 1).sqrt()
+    return b / b.max()   # [D], values in (0, 1]
+
+
 def exact_projection(z: torch.Tensor,
                      target_mean: float = 0.0,
                      target_std:  float = 1.0) -> torch.Tensor:
@@ -142,10 +163,17 @@ class SchrodingerAttention(nn.Module):
     O(1) continuous attention — exact train/inference equivalence.
 
     The recurrence is:
-        h_t = A · h_{t-1}  +  gate(x_t) · ψ_t
+        h_t = A · h_{t-1}  +  B ⊙ gate(x_t) · ψ_t
 
     A = exp((-γ+iω)·dt) is CONSTANT (not input-dependent).
-    gate(x_t) is purely content-based (no h_prev).
+    B = sqrt(2n+1) / max  is FIXED (HiPPO-LegS input coupling).
+    gate(x_t) is a SCALAR (not per-mode) — purely content-based.
+    ψ_t carries the content to write; B distributes it across modes optimally.
+
+    B and ω are both initialised from (2n+1)^0.5 — this is not a coincidence.
+    In diagonalised HiPPO-LegS, A's imaginary eigenvalues == B by construction.
+    Fixing B closes the loop: ω (A eigenvalue) is learned, B (input coupling)
+    is fixed at the provably optimal HiPPO values.
 
     This makes the recurrence LINEAR with constant coefficients, so the
     training FFT convolution is the EXACT same computation as the inference
@@ -168,14 +196,17 @@ class SchrodingerAttention(nn.Module):
         self.dt        = nn.Parameter(torch.tensor(0.1))       # integration step
 
         # ── Token → wave projections ──────────────────────────────────────
-        self.to_psi = nn.Linear(dim, dim * 2)   # excitation wave  ψ
-        self.to_phi = nn.Linear(dim, dim * 2)   # measurement wave φ
+        self.to_psi = nn.Linear(dim, dim * 2)   # excitation wave  ψ (content)
+        self.to_phi = nn.Linear(dim, dim * 2)   # measurement wave φ (read)
 
-        # ── Content-based write gate ──────────────────────────────────────
-        # Purely a function of x_t — no h_prev dependency.
-        # Controls HOW MUCH of the token is written into the field.
-        # Born-rule resonance happens at read time via (h · φ*).
-        self.write_gate = nn.Linear(dim, dim)
+        # ── HiPPO B coupling (fixed) + scalar write gate ──────────────────
+        # B: fixed frequency-importance weight. Mode n gets sqrt(2n+1)/max.
+        #    Low-order modes are slow+memory-holding; high-order are fast+input-driven.
+        #    Mathematically coupled to omega init — same (2n+1)^0.5 function.
+        # write_gate: SCALAR (1 output) — when to write, not which modes.
+        #    Which modes get how much is handled by B (provably optimal).
+        self.register_buffer('B', hippo_b_vector(dim))  # [D] fixed
+        self.write_gate = nn.Linear(dim, 1)             # scalar gate
 
     # ------------------------------------------------------------------
     def _A(self) -> torch.Tensor:
@@ -205,9 +236,11 @@ class SchrodingerAttention(nn.Module):
         phi_raw = self.to_phi(x)
         phi     = torch.complex(phi_raw[..., :D], phi_raw[..., D:])    # [B, L, D]
 
-        # Content gate: how strongly to write this token into the field
-        gate = torch.sigmoid(self.write_gate(x))                        # [B, L, D] real
-        U    = gate * psi                                                # [B, L, D] complex
+        # Scalar write gate — when to write (not which modes; B handles that)
+        gate = torch.sigmoid(self.write_gate(x))                        # [B, L, 1] real
+        # HiPPO B coupling: each mode n scaled by sqrt(2n+1)/max  [D]
+        B_c  = torch.complex(self.B, torch.zeros_like(self.B))          # [D] complex
+        U    = gate * B_c * psi                                          # [B, L, D] complex
 
         # ── Exact causal FFT convolution with kernel k(t) = A^t ─────────
         dt     = self.dt.abs()
@@ -251,10 +284,11 @@ class SchrodingerAttention(nn.Module):
         phi_raw = self.to_phi(x)
         phi     = torch.complex(phi_raw[..., :D], phi_raw[..., D:])    # [B, D]
 
-        gate = torch.sigmoid(self.write_gate(x))                        # [B, D]
+        gate = torch.sigmoid(self.write_gate(x))                        # [B, 1]
+        B_c  = torch.complex(self.B, torch.zeros_like(self.B))          # [D] complex
 
         # Exact recurrence — bit-identical to training FFT
-        h_next = h_prev * self._A() + gate * psi                        # [B, D]
+        h_next = h_prev * self._A() + gate * B_c * psi                  # [B, D]
 
         # Projection at READ TIME ONLY (not stored back into state),
         # matching the training path which projects only before measurement.
