@@ -186,9 +186,11 @@ class SchrodingerAttention(nn.Module):
     Inference O(1)       — bit-identical recurrent forward_step
     """
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, n_bands: int = 4):
         super().__init__()
-        self.dim = dim
+        self.dim    = dim
+        self.n_bands = n_bands   # spectral bands: each reads D/K independent modes
+        assert dim % n_bands == 0, f"dim={dim} must be divisible by n_bands={n_bands}"
 
         # ── Wave physics ──────────────────────────────────────────────────
         self.omega     = nn.Parameter(hippo_freqs(dim))        # [D] HiPPO rotation
@@ -198,6 +200,18 @@ class SchrodingerAttention(nn.Module):
         # ── Token → wave projections ──────────────────────────────────────
         self.to_psi = nn.Linear(dim, dim * 2)   # excitation wave  ψ (content)
         self.to_phi = nn.Linear(dim, dim * 2)   # measurement wave φ (read)
+        nn.init.orthogonal_(self.to_phi.weight)  # complete orthonormal basis at t=0
+
+        # ── HiPPO-aligned band boundaries ────────────────────────────────
+        # hippo_freqs returns exp(-sqrt(2n+1)/max · log10000), monotone ↓ in n.
+        # Argsort gives indices ordered slow→fast (low freq → high freq).
+        # We cut that ordering into K equal-count bands so each band spans
+        # one quartile of the HiPPO frequency spectrum, not a raw index range.
+        freqs     = hippo_freqs(dim)                          # [D] monotone ↓
+        order     = torch.argsort(freqs, descending=True)     # slow→fast
+        band_size = dim // n_bands
+        bands     = order.view(n_bands, band_size)            # [K, D/K] indices
+        self.register_buffer('band_idx', bands)               # [K, D/K] long
 
         # ── HiPPO B coupling (fixed) + scalar write gate ──────────────────
         # B: fixed frequency-importance weight. Mode n gets sqrt(2n+1)/max.
@@ -206,7 +220,12 @@ class SchrodingerAttention(nn.Module):
         # write_gate: SCALAR (1 output) — when to write, not which modes.
         #    Which modes get how much is handled by B (provably optimal).
         self.register_buffer('B', hippo_b_vector(dim))  # [D] fixed
-        self.write_gate = nn.Linear(dim, 1)             # scalar gate
+        self.write_gate = nn.Linear(dim, 1)   # scalar gate — WHEN to write
+        self.surprise_gain = nn.Parameter(torch.zeros(1))  # predictive coding depth
+        self.tau  = nn.Parameter(torch.ones(1))   # ignition temperature (init=1 → soft)
+        self.beta = nn.Parameter(torch.zeros(1))  # self-model density weight (init=0 → off)
+        # tau=1: standard softmax competition.  Sharpens as bands specialise.
+        # beta=0: no self-model at t=0. Activates when density carries gradient signal.
 
     # ------------------------------------------------------------------
     def _A(self) -> torch.Tensor:
@@ -218,7 +237,8 @@ class SchrodingerAttention(nn.Module):
         ))
 
     # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+               z_prev: torch.Tensor | None = None) -> torch.Tensor:
         """
         Exact parallel training pass via causal FFT convolution.
 
@@ -226,8 +246,9 @@ class SchrodingerAttention(nn.Module):
         is a causal convolution with kernel k(t) = A^t.
         The FFT computes this exactly in O(L log L).
 
-        x       : [B, L, D]  real
-        returns : [B, L, D]  real
+        x      : [B, L, D]  real
+        z_prev : [B, L, D]  previous layer's output (predictive coding signal)
+        returns: [B, L, D]  real
         """
         B, L, D = x.shape
 
@@ -236,8 +257,13 @@ class SchrodingerAttention(nn.Module):
         phi_raw = self.to_phi(x)
         phi     = torch.complex(phi_raw[..., :D], phi_raw[..., D:])    # [B, L, D]
 
-        # Scalar write gate — when to write (not which modes; B handles that)
+        # Predictive coding: gate scales with surprise (deviation from prediction).
+        # When z_prev perfectly predicts x, surprise→0 and gate closes.
+        # Wave only updates when it encounters something unexpected.
         gate = torch.sigmoid(self.write_gate(x))                        # [B, L, 1] real
+        if z_prev is not None:
+            surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, L, 1]
+            gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
         # HiPPO B coupling: each mode n scaled by sqrt(2n+1)/max  [D]
         B_c  = torch.complex(self.B, torch.zeros_like(self.B))          # [D] complex
         U    = gate * B_c * psi                                          # [B, L, D] complex
@@ -260,12 +286,39 @@ class SchrodingerAttention(nn.Module):
         # both accumulate raw state, both project only when measuring.
         H_proj = torch.complex(exact_projection(H.real), exact_projection(H.imag))
 
-        # Born-rule measurement: project field onto measurement wave
-        return (H_proj * phi.conj()).real                               # [B, L, D]
+        # Spectrometer: K bands each measure D/K modes independently.
+        # Bands follow HiPPO frequency quartiles: band 0 = slowest modes
+        # (long memory), band K-1 = fastest modes (reflexes).
+        # α_k = ⟨h_k*, φ_k⟩ / (D/K)  — one complex amplitude per band.
+        K  = self.n_bands
+        bx = self.band_idx                                              # [K, D/K]
+        Hb = H_proj[:, :, bx]                                          # [B, L, K, D/K]
+        Pb = phi[:, :, bx]                                             # [B, L, K, D/K]
+        alpha = (Hb.conj() * Pb).sum(-1, keepdim=True) / (D // K)     # [B, L, K, 1]
+
+        # Global workspace ignition: bands compete via softmax sharpened by tau.
+        # tau=1 at init → soft competition. Sharpens as bands specialise.
+        # Phase preserved — only magnitude |alpha| determines the winner.
+        # *K restores total energy (softmax sums to 1, not K).
+        c_k      = F.softmax(alpha.abs() / self.tau.clamp(min=1e-4), dim=2)  # [B, L, K, 1]
+        alpha_ig = alpha * c_k * K                                            # [B, L, K, 1]
+
+        # Self-model: per-band Born-rule density |h_k|² / (D/K).
+        # Each band reports its own self-confidence, not the global field.
+        # beta=0 at init → pure external measurement. Activates when density
+        # carries useful gradient signal (i.e. confident bands speak louder).
+        density   = (Hb.real**2 + Hb.imag**2).mean(-1, keepdim=True)          # [B, L, K, 1]
+        alpha_fin = alpha_ig + self.beta * density                             # [B, L, K, 1]
+
+        out_bands = (Hb * alpha_fin).real                                      # [B, L, K, D/K]
+        out = torch.zeros(B, L, D, device=x.device)
+        out[:, :, bx] = out_bands
+        return out                                                              # [B, L, D]
 
     # ------------------------------------------------------------------
     def forward_step(self, x: torch.Tensor,
-                     h_prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                     h_prev: torch.Tensor,
+                     z_prev: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         O(1) recurrent step — bit-identical to forward().
 
@@ -275,6 +328,7 @@ class SchrodingerAttention(nn.Module):
 
         x      : [B, D]  real token features
         h_prev : [B, D]  complex wave field
+        z_prev : [B, D]  previous layer output (predictive coding)
         returns: out [B, D] real, h_next [B, D] complex
         """
         D = self.dim
@@ -285,6 +339,9 @@ class SchrodingerAttention(nn.Module):
         phi     = torch.complex(phi_raw[..., :D], phi_raw[..., D:])    # [B, D]
 
         gate = torch.sigmoid(self.write_gate(x))                        # [B, 1]
+        if z_prev is not None:
+            surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, 1]
+            gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
         B_c  = torch.complex(self.B, torch.zeros_like(self.B))          # [D] complex
 
         # Exact recurrence — bit-identical to training FFT
@@ -295,8 +352,20 @@ class SchrodingerAttention(nn.Module):
         h_read = torch.complex(exact_projection(h_next.real),
                                exact_projection(h_next.imag))
 
-        # Born-rule measurement
-        out = (h_read * phi.conj()).real                                # [B, D]
+        # Spectrometer + ignition + self-model — bit-identical to forward()
+        Bsz = x.shape[0]
+        K   = self.n_bands
+        bx  = self.band_idx
+        Hb  = h_read[:, bx]                                            # [B, K, D/K]
+        Pb  = phi[:, bx]
+        alpha    = (Hb.conj() * Pb).sum(-1, keepdim=True) / (D // K)  # [B, K, 1]
+        c_k      = F.softmax(alpha.abs() / self.tau.clamp(min=1e-4), dim=1)  # [B, K, 1]
+        alpha_ig = alpha * c_k * K
+        density  = (Hb.real**2 + Hb.imag**2).mean(-1, keepdim=True)   # [B, K, 1]
+        alpha_fin = alpha_ig + self.beta * density
+        out_bands = (Hb * alpha_fin).real
+        out = torch.zeros(Bsz, D, device=x.device)
+        out[:, bx] = out_bands
         return out, h_next
 
 
@@ -329,13 +398,15 @@ class ContinuousTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         """x: [B, L]  →  logits [B, L, V], z [B, L, D]"""
-        z = self.embed(x)                                               # [B, L, D]
+        z      = self.embed(x)                                          # [B, L, D]
+        z_prev = torch.zeros_like(z)   # layer 0 has no prediction yet
         for i in range(self.depth):
-            z = z + self.depth_emb[i]
+            z_in = z + self.depth_emb[i]
             if self.training and self.use_checkpoint:
-                z = checkpoint(self.operators[i], z, use_reentrant=False)
+                z = checkpoint(self.operators[i], z_in, z_prev, use_reentrant=False)
             else:
-                z = self.operators[i](z)
+                z = self.operators[i](z_in, z_prev)
+            z_prev = z   # this layer's output = next layer's prediction
         logits = self.out_proj(z)                                       # [B, L, V]
         return logits, z
 
@@ -348,9 +419,12 @@ class ContinuousTransformer(nn.Module):
         returns: logits [B, 1, V], h_new [B, depth, D]
         """
         z        = self.embed(x).squeeze(1)                            # [B, D]
+        z_prev   = torch.zeros_like(z)
         h_layers = []
         for i in range(self.depth):
-            z, h_i = self.operators[i].forward_step(z + self.depth_emb[i], h_prev[:, i])
+            z_in = z + self.depth_emb[i]
+            z, h_i = self.operators[i].forward_step(z_in, h_prev[:, i], z_prev=z_prev)
+            z_prev = z
             h_layers.append(h_i)
         h_new  = torch.stack(h_layers, dim=1)                          # [B, depth, D]
         logits = self.out_proj(z).unsqueeze(1)                         # [B, 1, V]
@@ -425,7 +499,13 @@ def train(checkpoint_prefix: str = "continuous_transformer"):
         ckpt_path = f"{checkpoint_prefix}_step{latest:05d}.pt"
         print(f"Loading checkpoint: {ckpt_path}")
         try:
-            model.load_state_dict(torch.load(ckpt_path, map_location=device))
+            missing, unexpected = model.load_state_dict(
+                torch.load(ckpt_path, map_location=device), strict=False
+            )
+            if missing:
+                print(f"  New params (random init): {missing}")
+            if unexpected:
+                print(f"  Dropped params: {unexpected}")
             start_step = latest
             print(f"Resuming from step {start_step}")
         except Exception as e:
