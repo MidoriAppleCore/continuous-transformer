@@ -17,18 +17,32 @@ Generation O(1)       — true recurrent forward_step, infinite context
 # ---------------------------------------------------------------------------
 # Hyper-parameters
 # ---------------------------------------------------------------------------
-DIM            = 512
-DEPTH          = 6
+DIM            = int(512)
+DEPTH          = 8
 VOCAB_SIZE     = 256
+MIMO_P         = 8     # MIMO group size — channels mix in groups of P (P×P matmul)
 
 BASE_LR        = 3e-4
 WEIGHT_DECAY   = 0.01
 BATCH_SIZE     = 2
-SEQ_LENGTH     = 4096
+# Variable sequence length curriculum.
+# Each entry is (seq_len, sampling_probability).
+# Most steps are short (fast + diverse data); rare long steps train memory.
+# MAX_SEQ_LENGTH is derived automatically as the largest entry.
+SEQ_SCHEDULE = [
+    (256,  0.40),   # 40% — fast, maximum data diversity
+    (512,  0.30),   # 30% — sentence / short paragraph
+    (1024, 0.20),   # 20% — multi-paragraph context
+    (2048, 0.10),   # 10% — long context, exercises wave memory
+]
+MAX_SEQ_LENGTH = max(l for l, _ in SEQ_SCHEDULE)
 GRAD_CLIP      = 1.0
 
 CHECKPOINT_EVERY = 1000
 PRINT_EVERY      = 100
+
+USE_AMP      = True   # bfloat16 autocast — ~2x on Ampere, ~4x on A100 tensor cores
+NUM_WORKERS  = 4      # DataLoader prefetch workers (set 0 to debug)
 
 GEN_LENGTH      = 300
 GEN_TEMPERATURE = 0.85
@@ -109,6 +123,54 @@ class TinyStoriesDataset(Dataset):
             self._file.close()
 
 
+def prepare_openhermes_dataset(cache_dir: str = "~/.cache/continuous_transformer") -> str:
+    """
+    Download OpenHermes-2.5 and flatten to a single UTF-8 text file
+    using the same format as TinyStories so TinyStoriesDataset works unchanged.
+
+    Each conversation becomes:
+        <|user|>\n{prompt}\n<|assistant|>\n{response}\n<|end|>\n\n
+    Multi-turn conversations stack multiple user/assistant pairs before <|end|>.
+    All non-ASCII bytes are dropped so VOCAB_SIZE=256 is still valid.
+    """
+    cache_dir  = os.path.expanduser(cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+    out_path   = os.path.join(cache_dir, "openhermes_train.txt")
+    if os.path.exists(out_path):
+        print(f"Using cached dataset: {out_path} ({os.path.getsize(out_path)/1e6:.1f} MB)")
+        return out_path
+
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError("Run: pip install datasets")
+
+    print("Downloading OpenHermes-2.5 (this may take a few minutes)...")
+    ds = load_dataset("teknium/OpenHermes-2.5", split="train")
+    print(f"Downloaded {len(ds)} conversations. Flattening to text...")
+
+    with open(out_path, "w", encoding="ascii", errors="ignore") as f:
+        for row in ds:
+            # Each row has a 'conversations' list of {from, value} dicts
+            convs = row.get("conversations", [])
+            if not convs:
+                continue
+            buf = []
+            for turn in convs:
+                role  = turn.get("from", "").lower()   # 'human' or 'gpt'
+                value = turn.get("value", "").strip()
+                if not value:
+                    continue
+                tag = "<|user|>" if role == "human" else "<|assistant|>"
+                buf.append(f"{tag}\n{value}\n")
+            if buf:
+                f.write("".join(buf) + "<|end|>\n\n")
+
+    size = os.path.getsize(out_path)
+    print(f"Saved: {out_path} ({size/1e6:.1f} MB)")
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Math utilities  (verbatim from init commit)
 # ---------------------------------------------------------------------------
@@ -166,7 +228,16 @@ class SchrodingerAttention(nn.Module):
 
     Two waves per layer:
       Scout:  hs_t = A · hs_{t-1}  +  Bs(x_t) ⊙ gate · ψ_t     (input-only LTI)
-      True:   h_t  = A · h_{t-1}   +  Bt(x_t, hs_{t-1}) ⊙ gate · ψ_t
+      True:   h_t  = A · h_{t-1}   +  S(U_t)  (Simpson's quadrature)
+
+    Simpson's Rule discretization (4th-order quadrature):
+      S(U)_t = (1/6)·U_t + (4/6)·U_{t-1} + (1/6)·U_{t-2}
+      Fits a parabola through the last 3 wave-space inputs before integration.
+      Zero parameters. Subsumes trapezoidal (2nd-order) and Euler (1st-order).
+      Valid because U_t = gate·B·ψ is already in smooth complex wave space
+      (embedding + projection liquifies discrete tokens before quadrature).
+      Training: depthwise causal conv1d with fixed kernel [1/6, 4/6, 1/6].
+      Inference: 3-tap recurrent blend, U_{t-1} and U_{t-2} stored in state.
 
     A  = exp((-γ+iω)·dt)  is CONSTANT.
     Bs = softplus(W_scout · x_t)                             — input-only (scout)
@@ -188,7 +259,7 @@ class SchrodingerAttention(nn.Module):
     Inference O(1)       — two O(1) recurrent steps, one per wave
     """
 
-    def __init__(self, dim: int, n_bands: int = 4):
+    def __init__(self, dim: int, n_bands: int = 4, mimo_p: int = 8):
         super().__init__()
         self.dim    = dim
         self.n_bands = n_bands   # spectral bands: each reads D/K independent modes
@@ -231,15 +302,35 @@ class SchrodingerAttention(nn.Module):
         self.to_B_scout = nn.Linear(dim, dim)             # Scout: input-only coupling
         nn.init.zeros_(self.to_B_scout.weight)
         self.to_B_scout.bias.data.copy_(b0_inv)
-        self.to_B_true = nn.Linear(dim * 3, dim)          # True: x + Re(Hs) + Im(Hs)
-        nn.init.zeros_(self.to_B_true.weight)
-        self.to_B_true.bias.data.copy_(b0_inv)
+        self.to_B_true_x = nn.Linear(dim, dim)            # True: input path (no concat)
+        nn.init.zeros_(self.to_B_true_x.weight)
+        self.to_B_true_x.bias.data.copy_(b0_inv)          # softplus(b0_inv)=hippo_b at init
+        self.to_B_true_h = nn.Linear(dim * 2, dim)        # True: scout state path
+        nn.init.zeros_(self.to_B_true_h.weight)
+        nn.init.zeros_(self.to_B_true_h.bias)             # zero init — adds nothing at start
         self.write_gate = nn.Linear(dim, 1)   # scalar gate — WHEN to write
+        # Simpson's rule causal filter [1/6, 4/6, 1/6] — zero parameters.
+        # Applied as depthwise conv1d (training) / 3-tap recurrence (inference).
+        # Shape [D, 1, 3] for F.conv1d groups=dim.
+        simp = torch.tensor([1/6, 4/6, 1/6], dtype=torch.float32)
+        self.register_buffer('simpson_kernel', simp.view(1, 1, 3).expand(dim, -1, -1).clone())
         self.surprise_gain = nn.Parameter(torch.zeros(1))  # predictive coding depth
         self.tau  = nn.Parameter(torch.ones(1))   # ignition temperature (init=1 → soft)
         self.beta = nn.Parameter(torch.zeros(1))  # self-model density weight (init=0 → off)
         # tau=1: standard softmax competition.  Sharpens as bands specialise.
         # beta=0: no self-model at t=0. Activates when density carries gradient signal.
+        # ── MIMO grouped channel mixing ───────────────────────────────────────
+        # Groups D channels into G = D/P blocks of P; applies a learnable P×P matmul
+        # within each block after Born-rule readout.
+        # Raises arithmetic intensity ~0.25 → ~2P FLOP/byte, moving the 3050 Ti
+        # from memory-bound to compute-bound. Init = identity + ε so t=0 is unchanged.
+        assert dim % mimo_p == 0, f"dim={dim} must be divisible by mimo_p={mimo_p}"
+        self.mimo_p = mimo_p
+        G_mimo = dim // mimo_p
+        self.mimo_w = nn.Parameter(
+            torch.eye(mimo_p).unsqueeze(0).expand(G_mimo, -1, -1).clone()
+            + 0.02 * torch.randn(G_mimo, mimo_p, mimo_p)
+        )
 
     # ------------------------------------------------------------------
     def _A(self) -> torch.Tensor:
@@ -266,15 +357,15 @@ class SchrodingerAttention(nn.Module):
         """
         B, L, D = x.shape
 
-        psi_raw = self.to_psi(x)
+        psi_raw = self.to_psi(x).float()                                # fp32 — complex64 needs float32 parts
         psi     = torch.complex(psi_raw[..., :D], psi_raw[..., D:])    # [B, L, D]
-        phi_raw = self.to_phi(x)
+        phi_raw = self.to_phi(x).float()
         phi     = torch.complex(phi_raw[..., :D], phi_raw[..., D:])    # [B, L, D]
 
         # Predictive coding: gate scales with surprise (deviation from prediction).
         # When z_prev perfectly predicts x, surprise→0 and gate closes.
         # Wave only updates when it encounters something unexpected.
-        gate = torch.sigmoid(self.write_gate(x))                        # [B, L, 1] real
+        gate = torch.sigmoid(self.write_gate(x).float())                # [B, L, 1] real
         if z_prev is not None:
             surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, L, 1]
             gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
@@ -287,7 +378,7 @@ class SchrodingerAttention(nn.Module):
         K_freq = torch.fft.fft(kernel.T, n=n_fft, dim=1)               # [D, n_fft]
 
         # ── 1. Scout Wave (input-only LTI — runs first) ───────────────────
-        b_scout   = F.softplus(self.to_B_scout(x))                       # [B, L, D]
+        b_scout   = F.softplus(self.to_B_scout(x).float())               # [B, L, D]
         B_c_scout = torch.complex(b_scout, torch.zeros_like(b_scout))
         U_scout   = gate * B_c_scout * psi                                # [B, L, D]
         U_freq_scout = torch.fft.fft(U_scout.permute(0, 2, 1), n=n_fft, dim=2)
@@ -299,12 +390,20 @@ class SchrodingerAttention(nn.Module):
         # H_scout_prev[t] = H_scout[t-1]: what the scout knew *before* step t.
         H_scout_prev = F.pad(H_scout, (0, 0, 1, 0))[:, :-1, :]          # [B, L, D]
         H_prev_flat  = torch.cat([H_scout_prev.real, H_scout_prev.imag], dim=-1)  # [B, L, 2D]
-        smart_input  = torch.cat([x, H_prev_flat], dim=-1)               # [B, L, 3D]
-        b_true   = F.softplus(self.to_B_true(smart_input))               # [B, L, D]
+        b_true   = F.softplus(self.to_B_true_x(x).float() + self.to_B_true_h(H_prev_flat).float())  # [B, L, D]
         B_c_true = torch.complex(b_true, torch.zeros_like(b_true))
 
-        # ── 3. True Wave (state-dependent — the main wave used for output) ─
-        U_true      = gate * B_c_true * psi                               # [B, L, D]
+        # ── 3. True Wave — Simpson's rule quadrature (4th-order) ────────────
+        # S(U)_t = (1/6)·U_t + (4/6)·U_{t-1} + (1/6)·U_{t-2}
+        # Applied as depthwise causal conv1d with fixed kernel [1/6, 4/6, 1/6].
+        # Real and imaginary parts handled separately (linear op → equivalent).
+        # padding=2 then slice [:-2] gives exact causal alignment.
+        U_true_raw = gate * B_c_true * psi                                # [B, L, D] complex
+        Ur = U_true_raw.real.float().permute(0, 2, 1)                    # [B, D, L] fp32
+        Ui = U_true_raw.imag.float().permute(0, 2, 1)
+        Ur_s = F.conv1d(Ur, self.simpson_kernel.float(), padding=2, groups=D)[..., :-2].float()
+        Ui_s = F.conv1d(Ui, self.simpson_kernel.float(), padding=2, groups=D)[..., :-2].float()
+        U_true      = torch.complex(Ur_s, Ui_s).permute(0, 2, 1)        # [B, L, D]
         U_freq_true = torch.fft.fft(U_true.permute(0, 2, 1), n=n_fft, dim=2)
         H           = torch.fft.ifft(
             U_freq_true * K_freq.unsqueeze(0), n=n_fft, dim=2
@@ -313,7 +412,7 @@ class SchrodingerAttention(nn.Module):
         # Manifold projection at READ TIME ONLY — not inside the recurrence.
         # This keeps training (FFT) and inference (step loop) bit-identical:
         # both accumulate raw state, both project only when measuring.
-        H_proj = torch.complex(exact_projection(H.real), exact_projection(H.imag))
+        H_proj = torch.complex(F.layer_norm(H.real, [D]), F.layer_norm(H.imag, [D]))
 
         # Spectrometer: K bands each measure D/K modes independently.
         # Bands follow HiPPO frequency quartiles: band 0 = slowest modes
@@ -342,6 +441,11 @@ class SchrodingerAttention(nn.Module):
         out_bands = (Hb * alpha_fin).real                                      # [B, L, K, D/K]
         out = torch.zeros(B, L, D, device=x.device)
         out[:, :, bx] = out_bands
+        # ── MIMO: grouped cross-channel mixing ───────────────────────────────
+        # [B, L, D] → [B, L, G, P] → P×P matmul per group → [B, L, D]
+        # Cross-channel coupling within each group; ~2P× more FLOPs than SSM alone.
+        G, P = D // self.mimo_p, self.mimo_p
+        out = torch.einsum('gpq,blgq->blgp', self.mimo_w, out.reshape(B, L, G, P)).reshape(B, L, D)
         return out                                                              # [B, L, D]
 
     # ------------------------------------------------------------------
@@ -356,43 +460,46 @@ class SchrodingerAttention(nn.Module):
           True:   h_t  = A · h_{t-1}  + Bt(x_t, hs_{t-1}) ⊙ gate · ψ_t
 
         x      : [B, D]     real token features
-        h_prev : [B, 2, D]  complex — scout at [:, 0, :], true at [:, 1, :]
+        h_prev : [B, 4, D]  complex — scout[:, 0], true[:, 1], U_{t-1}[:, 2], U_{t-2}[:, 3]
         z_prev : [B, D]     previous layer output (predictive coding)
-        returns: out [B, D] real, h_next [B, 2, D] complex
+        returns: out [B, D] real, h_next [B, 4, D] complex
         """
         D = self.dim
 
-        psi_raw = self.to_psi(x)
+        psi_raw = self.to_psi(x).float()
         psi     = torch.complex(psi_raw[..., :D], psi_raw[..., D:])    # [B, D]
-        phi_raw = self.to_phi(x)
+        phi_raw = self.to_phi(x).float()
         phi     = torch.complex(phi_raw[..., :D], phi_raw[..., D:])    # [B, D]
 
-        gate = torch.sigmoid(self.write_gate(x))                        # [B, 1]
+        gate = torch.sigmoid(self.write_gate(x).float())                # [B, 1]
         if z_prev is not None:
             surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, 1]
             gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
 
-        # Unpack dual states: h_prev is [B, 2, D]
+        # Unpack: h_prev is [B, 4, D] — scout, true, U_{t-1}, U_{t-2}
         h_prev_scout = h_prev[:, 0, :]   # [B, D] complex
         h_prev_true  = h_prev[:, 1, :]   # [B, D] complex
+        h_prev_U1    = h_prev[:, 2, :]   # [B, D] U_{t-1}
+        h_prev_U2    = h_prev[:, 3, :]   # [B, D] U_{t-2}
 
         # 1. Scout step (input-only — matches forward's scout wave)
-        b_scout      = F.softplus(self.to_B_scout(x))
+        b_scout      = F.softplus(self.to_B_scout(x).float())
         B_c_scout    = torch.complex(b_scout, torch.zeros_like(b_scout))
         h_next_scout = h_prev_scout * self._A() + gate * B_c_scout * psi  # [B, D]
 
-        # 2. True step (state-dependent — uses h_prev_scout, the PREVIOUS scout state)
+        # 2. True step — Simpson's rule: S(U)_t = (1/6)U_t + (4/6)U_{t-1} + (1/6)U_{t-2}
         h_prev_flat  = torch.cat([h_prev_scout.real, h_prev_scout.imag], dim=-1)  # [B, 2D]
-        smart_input  = torch.cat([x, h_prev_flat], dim=-1)               # [B, 3D]
-        b_true       = F.softplus(self.to_B_true(smart_input))
+        b_true       = F.softplus(self.to_B_true_x(x).float() + self.to_B_true_h(h_prev_flat).float())
         B_c_true     = torch.complex(b_true, torch.zeros_like(b_true))
-        h_next_true  = h_prev_true  * self._A() + gate * B_c_true * psi  # [B, D]
+        U_curr       = gate * B_c_true * psi                              # [B, D] raw U
+        U_smooth     = (1/6)*U_curr + (4/6)*h_prev_U1 + (1/6)*h_prev_U2  # Simpson's
+        h_next_true  = h_prev_true * self._A() + U_smooth                 # [B, D]
 
-        h_next = torch.stack([h_next_scout, h_next_true], dim=1)         # [B, 2, D]
+        h_next = torch.stack([h_next_scout, h_next_true, U_curr, h_prev_U1], dim=1)  # [B, 4, D]
 
         # Projection at READ TIME ONLY — project the true wave for measurement.
-        h_read = torch.complex(exact_projection(h_next_true.real),
-                               exact_projection(h_next_true.imag))
+        h_read = torch.complex(F.layer_norm(h_next_true.real, [D]),
+                               F.layer_norm(h_next_true.imag, [D]))
 
         # Spectrometer + ignition + self-model — bit-identical to forward()
         Bsz = x.shape[0]
@@ -408,6 +515,9 @@ class SchrodingerAttention(nn.Module):
         out_bands = (Hb * alpha_fin).real
         out = torch.zeros(Bsz, D, device=x.device)
         out[:, bx] = out_bands
+        # MIMO grouped mixing — matches forward() exactly
+        G, P = D // self.mimo_p, self.mimo_p
+        out = torch.einsum('gpq,bgq->bgp', self.mimo_w, out.reshape(Bsz, G, P)).reshape(Bsz, D)
         return out, h_next
 
 
@@ -434,7 +544,7 @@ class ContinuousTransformer(nn.Module):
         # Independent physics per layer: each has its own omega, log_gamma, dt.
         # Layer 0 tends to learn letter-level patterns (fast decay).
         # Layer 5 tends to learn theme-level patterns (slow decay).
-        self.operators = nn.ModuleList([SchrodingerAttention(dim) for _ in range(depth)])
+        self.operators = nn.ModuleList([SchrodingerAttention(dim, mimo_p=MIMO_P) for _ in range(depth)])
         self.depth_emb = nn.Parameter(torch.randn(depth, dim) * 0.02)
         self.out_proj  = nn.Linear(dim, vocab)
 
@@ -485,8 +595,8 @@ def generate(model: nn.Module, prompt: str, device: str = "cuda",
     tokens = [ord(c) for c in prompt]
     print(f"\nGeneration (O(1) recurrent): {prompt}", end="", flush=True)
 
-    # Initialize empty wave fields for all depth layers (scout + true per layer)
-    h = torch.zeros(1, model.depth, 2, model.dim, dtype=torch.complex64, device=device)
+    # Initialize empty wave fields: scout, true, U_{t-1}, U_{t-2} per layer
+    h = torch.zeros(1, model.depth, 4, model.dim, dtype=torch.complex64, device=device)
 
     # Encode the prompt by stepping through it token by token
     for tok in tokens:
@@ -516,6 +626,86 @@ def generate(model: nn.Module, prompt: str, device: str = "cuda",
 
 
 # ---------------------------------------------------------------------------
+# Needle-in-a-Haystack evaluation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate_niah(model: nn.Module, device: str = "cuda",
+                  n_trials: int = 20,
+                  haystack_len: int = 2000,
+                  needle_key_len: int = 8,
+                  needle_val_len: int = 8,
+                  depths: tuple = (0.1, 0.25, 0.5, 0.75, 0.9)) -> dict:
+    """
+    Synthetic Needle-in-a-Haystack test (byte-level, VOCAB=256 compatible).
+
+    For each trial and each needle depth:
+      1. Build a haystack of `haystack_len` random printable ASCII bytes.
+      2. Insert "KEY=<key> VALUE=<val>" at position floor(depth * haystack_len).
+      3. Append "Q: VALUE after KEY=<key>? A: " as the query.
+      4. Step through the full context with forward_step (O(1) per token).
+      5. Greedily decode `needle_val_len` tokens and check exact match.
+
+    Returns dict: {depth: accuracy} + 'mean' key.
+    """
+    import random, string
+    model.eval()
+
+    printable = [c for c in string.printable if c.isprintable() and ord(c) < 128
+                 and c not in '<>=\n\r']
+
+    depth_hits   = {d: 0 for d in depths}
+    depth_trials = {d: 0 for d in depths}
+
+    for trial in range(n_trials):
+        # Fresh random key and value for each trial
+        key = ''.join(random.choices(string.ascii_uppercase, k=needle_key_len))
+        val = ''.join(random.choices(string.digits, k=needle_val_len))
+        needle = f"KEY={key} VALUE={val} "
+
+        haystack_chars = random.choices(printable, k=haystack_len)
+
+        for depth in depths:
+            insert_pos = int(depth * haystack_len)
+            chars = haystack_chars[:insert_pos] + list(needle) + haystack_chars[insert_pos:]
+            query = f"Q: VALUE after KEY={key}? A: "
+            full  = "".join(chars) + query
+
+            # Encode as bytes and step through
+            tokens = [ord(c) for c in full if ord(c) < 128]
+            h = torch.zeros(1, model.depth, 3, model.dim,
+                            dtype=torch.complex64, device=device)
+            for tok in tokens:
+                t = torch.tensor([[tok]], device=device)
+                _, h = model.forward_step(t, h)
+
+            # Greedy decode val_len tokens
+            decoded = []
+            tok = tokens[-1]
+            for _ in range(needle_val_len):
+                t = torch.tensor([[tok]], device=device)
+                logits, h = model.forward_step(t, h)
+                tok = logits[0, -1].argmax().item()
+                decoded.append(chr(tok) if 32 <= tok < 128 else '?')
+
+            predicted = "".join(decoded)
+            depth_hits[depth]   += int(predicted == val)
+            depth_trials[depth] += 1
+
+    results = {d: depth_hits[d] / depth_trials[d] for d in depths}
+    results['mean'] = sum(results[d] for d in depths) / len(depths)
+
+    print(f"\n── NIAH (haystack={haystack_len}, key={needle_key_len}B, val={needle_val_len}B) ──")
+    for d in depths:
+        bar = "█" * int(results[d] * 20) + "░" * (20 - int(results[d] * 20))
+        print(f"  depth {d:.2f}: {bar}  {results[d]*100:.1f}%")
+    print(f"  mean accuracy: {results['mean']*100:.1f}%\n")
+
+    model.train()
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -525,9 +715,28 @@ def train(checkpoint_prefix: str = "continuous_transformer"):
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    data_path  = prepare_tinystories_dataset()
-    dataset    = TinyStoriesDataset(data_path, seq_length=SEQ_LENGTH)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    data_path  = prepare_openhermes_dataset()
+    # Dataset always loads MAX_SEQ_LENGTH; variable_collate_fn truncates each
+    # batch to a length sampled from SEQ_SCHEDULE before it hits the model.
+    dataset    = TinyStoriesDataset(data_path, seq_length=MAX_SEQ_LENGTH, stride=256)
+
+    _lengths = [l for l, _ in SEQ_SCHEDULE]
+    _probs   = np.array([p for _, p in SEQ_SCHEDULE], dtype=np.float64)
+    _probs  /= _probs.sum()   # normalise in case they don't sum to 1
+
+    def variable_collate_fn(batch):
+        """Sample one seq_len from SEQ_SCHEDULE and truncate the whole batch."""
+        L   = int(np.random.choice(_lengths, p=_probs))
+        xs  = torch.stack([item[0][:L] for item in batch])
+        ys  = torch.stack([item[1][:L] for item in batch])
+        return xs, ys
+
+    dataloader = DataLoader(
+        dataset, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=NUM_WORKERS, pin_memory=True,
+        persistent_workers=(NUM_WORKERS > 0),
+        collate_fn=variable_collate_fn,
+    )
 
     model  = ContinuousTransformer(dim=DIM, depth=DEPTH, vocab=VOCAB_SIZE).to(device)
     params = sum(p.numel() for p in model.parameters())
@@ -557,6 +766,11 @@ def train(checkpoint_prefix: str = "continuous_transformer"):
         start_step = 0
         print("No checkpoint found. Starting fresh.")
 
+    # torch.compile disabled locally: torchinductor has no complex op codegen,
+    # so it adds graph-materialization memory overhead with zero fusion benefit.
+    # Re-enable on Colab A100 where complex CUDA kernels are available:
+    #   model = torch.compile(model)
+
     opt      = optim.AdamW(model.parameters(), lr=BASE_LR, weight_decay=WEIGHT_DECAY)
     ema_loss = None
     step     = start_step
@@ -566,16 +780,19 @@ def train(checkpoint_prefix: str = "continuous_transformer"):
             for x, y in dataloader:
                 x, y = x.to(device), y.to(device)
 
-                logits, _ = model(x)
-                loss = nn.CrossEntropyLoss()(logits.view(-1, VOCAB_SIZE), y.view(-1))
+                # bfloat16 matmuls (linear layers) + float32 wave physics / loss
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                    enabled=USE_AMP and device.type == 'cuda'):
+                    logits, _ = model(x)
+                    loss = nn.CrossEntropyLoss()(logits.view(-1, VOCAB_SIZE), y.view(-1))
 
-                opt.zero_grad()
+                opt.zero_grad(set_to_none=True)
                 loss.backward()
 
+                # clip_grad_norm_ returns pre-clip total norm — reuse for reactive LR
+                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+
                 with torch.no_grad():
-                    grad_norm = sum(
-                        p.grad.norm() ** 2 for p in model.parameters() if p.grad is not None
-                    ) ** 0.5
                     if ema_loss is None:
                         ema_loss = loss.item()
                     ema_loss    = 0.95 * ema_loss + 0.05 * loss.item()
@@ -584,20 +801,19 @@ def train(checkpoint_prefix: str = "continuous_transformer"):
                     for pg in opt.param_groups:
                         pg["lr"] = reactive_lr
 
-                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 opt.step()
 
                 if step % PRINT_EVERY == 0:
                     acc = (logits.argmax(-1) == y).float().mean()
                     dts = " ".join(f"{op.dt.item():.3f}" for op in model.operators)
                     print(
-                        f"Step {step:05d} | Loss: {loss.item():.4f} | "
+                        f"Step {step:05d} | L={x.shape[1]:4d} | Loss: {loss.item():.4f} | "
                         f"Acc: {acc.item()*100:.1f}% | LR: {reactive_lr:.2e} | "
                         f"dt: [{dts}]"
                     )
 
                 if step % CHECKPOINT_EVERY == 0 and step > start_step:
-                    generate(model, "Once upon a time", device=str(device))
+                    generate(model, "<|user|>\nTell me a story about a dog.\n<|assistant|>\n", device=str(device))
                     ckpt_path = f"{checkpoint_prefix}_step{step:05d}.pt"
                     torch.save(model.state_dict(), ckpt_path)
                     print(f"Checkpoint saved: {ckpt_path}")
