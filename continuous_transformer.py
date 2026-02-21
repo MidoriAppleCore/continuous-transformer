@@ -17,7 +17,7 @@ Generation O(1)       — true recurrent forward_step, infinite context
 # ---------------------------------------------------------------------------
 # Hyper-parameters
 # ---------------------------------------------------------------------------
-DIM            = int(512)
+DIM            = int(1024*1.25)
 DEPTH          = 8
 VOCAB_SIZE     = 256
 MIMO_P         = 8     # MIMO group size — channels mix in groups of P (P×P matmul)
