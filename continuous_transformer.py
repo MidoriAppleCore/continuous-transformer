@@ -166,18 +166,17 @@ class SchrodingerAttention(nn.Module):
         h_t = A · h_{t-1}  +  B ⊙ gate(x_t) · ψ_t
 
     A = exp((-γ+iω)·dt) is CONSTANT (not input-dependent).
-    B = sqrt(2n+1) / max  is FIXED (HiPPO-LegS input coupling).
+    B_t = softplus(W_B · x_t)  is INPUT-DEPENDENT (hypernet, Mamba-style selection).
     gate(x_t) is a SCALAR (not per-mode) — purely content-based.
-    ψ_t carries the content to write; B distributes it across modes optimally.
+    ψ_t carries the content to write; B_t selects which modes receive it.
 
-    B and ω are both initialised from (2n+1)^0.5 — this is not a coincidence.
-    In diagonalised HiPPO-LegS, A's imaginary eigenvalues == B by construction.
-    Fixing B closes the loop: ω (A eigenvalue) is learned, B (input coupling)
-    is fixed at the provably optimal HiPPO values.
+    B_t is initialised so softplus(W_B · 0) = hippo_b_vector exactly (inverse
+    softplus bias init, zero weight).  Training starts from the HiPPO optimum
+    and adapts per-token from there — same expressiveness as Mamba's selection.
 
-    This makes the recurrence LINEAR with constant coefficients, so the
-    training FFT convolution is the EXACT same computation as the inference
-    recurrence — not an approximation.  No train/inference mismatch.
+    FFT exactness is PRESERVED despite input-dependent B because B only affects
+    U_t (the input sequence), not the kernel k(t) = A^t (which is still constant).
+    H = IFFT(FFT(U) · FFT(k)) is valid for any U_t.  No train/inference mismatch.
 
     Born-rule physics is preserved in the READ step:
         out_t = Re(h_t · φ_t*)   ← wave interference / measurement
@@ -213,13 +212,23 @@ class SchrodingerAttention(nn.Module):
         bands     = order.view(n_bands, band_size)            # [K, D/K] indices
         self.register_buffer('band_idx', bands)               # [K, D/K] long
 
-        # ── HiPPO B coupling (fixed) + scalar write gate ──────────────────
-        # B: fixed frequency-importance weight. Mode n gets sqrt(2n+1)/max.
-        #    Low-order modes are slow+memory-holding; high-order are fast+input-driven.
-        #    Mathematically coupled to omega init — same (2n+1)^0.5 function.
-        # write_gate: SCALAR (1 output) — when to write, not which modes.
-        #    Which modes get how much is handled by B (provably optimal).
-        self.register_buffer('B', hippo_b_vector(dim))  # [D] fixed
+        # ── HiPPO B coupling (input-dependent hypernet) + scalar write gate ────
+        # to_B: hypernet x → b, same pattern as to_psi / to_phi.
+        #   b_t = softplus(to_B(x_t))  — per-token mode coupling  [D]
+        #   This is Mamba's selection mechanism: WHICH modes get written
+        #   depends on the token, not just fixed HiPPO weights.
+        #   FFT exactness is preserved because B only affects U_t (the input),
+        #   not the kernel A^t — H = IFFT(FFT(U)·FFT(kernel)) is still exact.
+        # Initialization: zero weight, bias = softplus_inv(hippo_b_vector)
+        #   so that at zero input softplus(to_B(0)) == hippo_b_vector exactly.
+        #   Training starts from the provably optimal HiPPO distribution.
+        # write_gate: SCALAR — still controls WHEN to write.
+        #   to_B controls WHICH modes. Both together match Mamba expressiveness.
+        b0 = hippo_b_vector(dim)                          # [D] target at zero input
+        b0_inv = torch.log(torch.exp(b0.clamp(min=1e-6)) - 1.0)  # softplus⁻¹
+        self.to_B = nn.Linear(dim, dim)                   # input-dependent coupling
+        nn.init.zeros_(self.to_B.weight)
+        self.to_B.bias.data.copy_(b0_inv)
         self.write_gate = nn.Linear(dim, 1)   # scalar gate — WHEN to write
         self.surprise_gain = nn.Parameter(torch.zeros(1))  # predictive coding depth
         self.tau  = nn.Parameter(torch.ones(1))   # ignition temperature (init=1 → soft)
@@ -264,9 +273,11 @@ class SchrodingerAttention(nn.Module):
         if z_prev is not None:
             surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, L, 1]
             gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
-        # HiPPO B coupling: each mode n scaled by sqrt(2n+1)/max  [D]
-        B_c  = torch.complex(self.B, torch.zeros_like(self.B))          # [D] complex
-        U    = gate * B_c * psi                                          # [B, L, D] complex
+        # HiPPO B coupling: per-token mode-selection hypernet (Mamba-style).
+        # softplus ensures positive coupling; init reproduces hippo_b_vector at zero input.
+        b_tok = F.softplus(self.to_B(x))                                 # [B, L, D] real
+        B_c   = torch.complex(b_tok, torch.zeros_like(b_tok))            # [B, L, D] complex
+        U     = gate * B_c * psi                                          # [B, L, D] complex
 
         # ── Exact causal FFT convolution with kernel k(t) = A^t ─────────
         dt     = self.dt.abs()
@@ -342,7 +353,8 @@ class SchrodingerAttention(nn.Module):
         if z_prev is not None:
             surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, 1]
             gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
-        B_c  = torch.complex(self.B, torch.zeros_like(self.B))          # [D] complex
+        b_tok = F.softplus(self.to_B(x))                                 # [B, D] real
+        B_c   = torch.complex(b_tok, torch.zeros_like(b_tok))            # [B, D] complex
 
         # Exact recurrence — bit-identical to training FFT
         h_next = h_prev * self._A() + gate * B_c * psi                  # [B, D]
