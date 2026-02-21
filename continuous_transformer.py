@@ -162,27 +162,30 @@ class SchrodingerAttention(nn.Module):
     """
     O(1) continuous attention — exact train/inference equivalence.
 
-    The recurrence is:
-        h_t = A · h_{t-1}  +  B ⊙ gate(x_t) · ψ_t
+    Dual Wave Architecture — state-dependent selection with exact parallel training.
 
-    A = exp((-γ+iω)·dt) is CONSTANT (not input-dependent).
-    B_t = softplus(W_B · x_t)  is INPUT-DEPENDENT (hypernet, Mamba-style selection).
-    gate(x_t) is a SCALAR (not per-mode) — purely content-based.
-    ψ_t carries the content to write; B_t selects which modes receive it.
+    Two waves per layer:
+      Scout:  hs_t = A · hs_{t-1}  +  Bs(x_t) ⊙ gate · ψ_t     (input-only LTI)
+      True:   h_t  = A · h_{t-1}   +  Bt(x_t, hs_{t-1}) ⊙ gate · ψ_t
 
-    B_t is initialised so softplus(W_B · 0) = hippo_b_vector exactly (inverse
-    softplus bias init, zero weight).  Training starts from the HiPPO optimum
-    and adapts per-token from there — same expressiveness as Mamba's selection.
+    A  = exp((-γ+iω)·dt)  is CONSTANT.
+    Bs = softplus(W_scout · x_t)                             — input-only (scout)
+    Bt = softplus(W_true  · [x_t, Re(hs_{t-1}), Im(hs_{t-1})])  — state-dependent
+    gate(x_t) is a shared SCALAR controlling WHEN to write.
 
-    FFT exactness is PRESERVED despite input-dependent B because B only affects
-    U_t (the input sequence), not the kernel k(t) = A^t (which is still constant).
-    H = IFFT(FFT(U) · FFT(k)) is valid for any U_t.  No train/inference mismatch.
+    Why FFT is still exact for the true wave:
+      The scout is fully computed first (no dependence on the true wave).
+      Bt then depends only on scout state — a fully determined sequence.
+      H_true = IFFT(FFT(U_true) · FFT(kernel)) is valid; kernel A^t is still constant.
 
-    Born-rule physics is preserved in the READ step:
+    Result: Mamba-level state-dependence using pure PyTorch FFT, no CUDA kernels.
+    Train/inference equivalence is EXACT — both paths track the same two recurrences.
+
+    Born-rule measurement uses the true wave only:
         out_t = Re(h_t · φ_t*)   ← wave interference / measurement
 
-    Training  O(L log L) — exact causal FFT convolution
-    Inference O(1)       — bit-identical recurrent forward_step
+    Training  O(L log L) — two parallel FFT convolutions
+    Inference O(1)       — two O(1) recurrent steps, one per wave
     """
 
     def __init__(self, dim: int, n_bands: int = 4):
@@ -212,23 +215,25 @@ class SchrodingerAttention(nn.Module):
         bands     = order.view(n_bands, band_size)            # [K, D/K] indices
         self.register_buffer('band_idx', bands)               # [K, D/K] long
 
-        # ── HiPPO B coupling (input-dependent hypernet) + scalar write gate ────
-        # to_B: hypernet x → b, same pattern as to_psi / to_phi.
-        #   b_t = softplus(to_B(x_t))  — per-token mode coupling  [D]
-        #   This is Mamba's selection mechanism: WHICH modes get written
-        #   depends on the token, not just fixed HiPPO weights.
-        #   FFT exactness is preserved because B only affects U_t (the input),
-        #   not the kernel A^t — H = IFFT(FFT(U)·FFT(kernel)) is still exact.
-        # Initialization: zero weight, bias = softplus_inv(hippo_b_vector)
-        #   so that at zero input softplus(to_B(0)) == hippo_b_vector exactly.
-        #   Training starts from the provably optimal HiPPO distribution.
-        # write_gate: SCALAR — still controls WHEN to write.
-        #   to_B controls WHICH modes. Both together match Mamba expressiveness.
+        # ── Dual Wave B coupling + scalar write gate ─────────────────────
+        # Scout B (to_B_scout): input-only LTI. Runs first, feels the sequence shape.
+        #   Bs_t = softplus(W_scout · x_t)  — standard Mamba-style selection.
+        #   FFT exactness preserved: Bs only affects U_t, not the kernel A^t.
+        # True B (to_B_true): the Smart Bouncer — sees x AND the scout's past state.
+        #   Bt_t = softplus(W_true · [x_t, Re(hs_{t-1}), Im(hs_{t-1})])
+        #   Scout is fully computed first → Bt is a determined sequence → FFT valid.
+        #   Achieves Mamba-level state-dependence without custom CUDA kernels.
+        # Both inited: zero weight, bias = softplus_inv(hippo_b_vector).
+        #   softplus(W·0) == hippo_b_vector — starts from the HiPPO optimum.
+        # write_gate: shared SCALAR — controls WHEN to write (both waves).
         b0 = hippo_b_vector(dim)                          # [D] target at zero input
         b0_inv = torch.log(torch.exp(b0.clamp(min=1e-6)) - 1.0)  # softplus⁻¹
-        self.to_B = nn.Linear(dim, dim)                   # input-dependent coupling
-        nn.init.zeros_(self.to_B.weight)
-        self.to_B.bias.data.copy_(b0_inv)
+        self.to_B_scout = nn.Linear(dim, dim)             # Scout: input-only coupling
+        nn.init.zeros_(self.to_B_scout.weight)
+        self.to_B_scout.bias.data.copy_(b0_inv)
+        self.to_B_true = nn.Linear(dim * 3, dim)          # True: x + Re(Hs) + Im(Hs)
+        nn.init.zeros_(self.to_B_true.weight)
+        self.to_B_true.bias.data.copy_(b0_inv)
         self.write_gate = nn.Linear(dim, 1)   # scalar gate — WHEN to write
         self.surprise_gain = nn.Parameter(torch.zeros(1))  # predictive coding depth
         self.tau  = nn.Parameter(torch.ones(1))   # ignition temperature (init=1 → soft)
@@ -273,24 +278,37 @@ class SchrodingerAttention(nn.Module):
         if z_prev is not None:
             surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, L, 1]
             gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
-        # HiPPO B coupling: per-token mode-selection hypernet (Mamba-style).
-        # softplus ensures positive coupling; init reproduces hippo_b_vector at zero input.
-        b_tok = F.softplus(self.to_B(x))                                 # [B, L, D] real
-        B_c   = torch.complex(b_tok, torch.zeros_like(b_tok))            # [B, L, D] complex
-        U     = gate * B_c * psi                                          # [B, L, D] complex
-
-        # ── Exact causal FFT convolution with kernel k(t) = A^t ─────────
+        # ── Dual Wave: shared kernel ──────────────────────────────────────
         dt     = self.dt.abs()
         lam    = torch.complex(-torch.exp(self.log_gamma), self.omega)  # [D]
         t_axis = torch.arange(L, device=x.device, dtype=torch.float32)
         kernel = torch.exp(lam.unsqueeze(0) * t_axis.unsqueeze(1) * dt) # [L, D]
-
         n_fft  = 2 * L
         K_freq = torch.fft.fft(kernel.T, n=n_fft, dim=1)               # [D, n_fft]
-        U_freq = torch.fft.fft(U.permute(0, 2, 1), n=n_fft, dim=2)    # [B, D, n_fft]
-        H      = torch.fft.ifft(
-                     U_freq * K_freq.unsqueeze(0), n=n_fft, dim=2
-                 )[:, :, :L].permute(0, 2, 1)                          # [B, L, D]
+
+        # ── 1. Scout Wave (input-only LTI — runs first) ───────────────────
+        b_scout   = F.softplus(self.to_B_scout(x))                       # [B, L, D]
+        B_c_scout = torch.complex(b_scout, torch.zeros_like(b_scout))
+        U_scout   = gate * B_c_scout * psi                                # [B, L, D]
+        U_freq_scout = torch.fft.fft(U_scout.permute(0, 2, 1), n=n_fft, dim=2)
+        H_scout   = torch.fft.ifft(
+            U_freq_scout * K_freq.unsqueeze(0), n=n_fft, dim=2
+        )[:, :, :L].permute(0, 2, 1)                                     # [B, L, D]
+
+        # ── 2. Smart Bouncer — causal state-dependent B for the true wave ─
+        # H_scout_prev[t] = H_scout[t-1]: what the scout knew *before* step t.
+        H_scout_prev = F.pad(H_scout, (0, 0, 1, 0))[:, :-1, :]          # [B, L, D]
+        H_prev_flat  = torch.cat([H_scout_prev.real, H_scout_prev.imag], dim=-1)  # [B, L, 2D]
+        smart_input  = torch.cat([x, H_prev_flat], dim=-1)               # [B, L, 3D]
+        b_true   = F.softplus(self.to_B_true(smart_input))               # [B, L, D]
+        B_c_true = torch.complex(b_true, torch.zeros_like(b_true))
+
+        # ── 3. True Wave (state-dependent — the main wave used for output) ─
+        U_true      = gate * B_c_true * psi                               # [B, L, D]
+        U_freq_true = torch.fft.fft(U_true.permute(0, 2, 1), n=n_fft, dim=2)
+        H           = torch.fft.ifft(
+            U_freq_true * K_freq.unsqueeze(0), n=n_fft, dim=2
+        )[:, :, :L].permute(0, 2, 1)                                     # [B, L, D]
 
         # Manifold projection at READ TIME ONLY — not inside the recurrence.
         # This keeps training (FFT) and inference (step loop) bit-identical:
@@ -333,14 +351,14 @@ class SchrodingerAttention(nn.Module):
         """
         O(1) recurrent step — bit-identical to forward().
 
-        The FFT in training computes: H_t = Σ_{s≤t} A^{t-s} · U_s
-        This step computes:           h_t = A · h_{t-1} + U_t
-        They are the same recurrence, one position at a time.
+        Runs two recurrences matching the training Dual Wave FFT:
+          Scout:  hs_t = A · hs_{t-1} + Bs(x_t) ⊙ gate · ψ_t
+          True:   h_t  = A · h_{t-1}  + Bt(x_t, hs_{t-1}) ⊙ gate · ψ_t
 
-        x      : [B, D]  real token features
-        h_prev : [B, D]  complex wave field
-        z_prev : [B, D]  previous layer output (predictive coding)
-        returns: out [B, D] real, h_next [B, D] complex
+        x      : [B, D]     real token features
+        h_prev : [B, 2, D]  complex — scout at [:, 0, :], true at [:, 1, :]
+        z_prev : [B, D]     previous layer output (predictive coding)
+        returns: out [B, D] real, h_next [B, 2, D] complex
         """
         D = self.dim
 
@@ -353,16 +371,28 @@ class SchrodingerAttention(nn.Module):
         if z_prev is not None:
             surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, 1]
             gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
-        b_tok = F.softplus(self.to_B(x))                                 # [B, D] real
-        B_c   = torch.complex(b_tok, torch.zeros_like(b_tok))            # [B, D] complex
 
-        # Exact recurrence — bit-identical to training FFT
-        h_next = h_prev * self._A() + gate * B_c * psi                  # [B, D]
+        # Unpack dual states: h_prev is [B, 2, D]
+        h_prev_scout = h_prev[:, 0, :]   # [B, D] complex
+        h_prev_true  = h_prev[:, 1, :]   # [B, D] complex
 
-        # Projection at READ TIME ONLY (not stored back into state),
-        # matching the training path which projects only before measurement.
-        h_read = torch.complex(exact_projection(h_next.real),
-                               exact_projection(h_next.imag))
+        # 1. Scout step (input-only — matches forward's scout wave)
+        b_scout      = F.softplus(self.to_B_scout(x))
+        B_c_scout    = torch.complex(b_scout, torch.zeros_like(b_scout))
+        h_next_scout = h_prev_scout * self._A() + gate * B_c_scout * psi  # [B, D]
+
+        # 2. True step (state-dependent — uses h_prev_scout, the PREVIOUS scout state)
+        h_prev_flat  = torch.cat([h_prev_scout.real, h_prev_scout.imag], dim=-1)  # [B, 2D]
+        smart_input  = torch.cat([x, h_prev_flat], dim=-1)               # [B, 3D]
+        b_true       = F.softplus(self.to_B_true(smart_input))
+        B_c_true     = torch.complex(b_true, torch.zeros_like(b_true))
+        h_next_true  = h_prev_true  * self._A() + gate * B_c_true * psi  # [B, D]
+
+        h_next = torch.stack([h_next_scout, h_next_true], dim=1)         # [B, 2, D]
+
+        # Projection at READ TIME ONLY — project the true wave for measurement.
+        h_read = torch.complex(exact_projection(h_next_true.real),
+                               exact_projection(h_next_true.imag))
 
         # Spectrometer + ignition + self-model — bit-identical to forward()
         Bsz = x.shape[0]
@@ -426,9 +456,9 @@ class ContinuousTransformer(nn.Module):
         """
         Single-token recurrent step.
 
-        x      : [B, 1]  token indices
-        h_prev : [B, depth, D]  complex wave fields (one per layer)
-        returns: logits [B, 1, V], h_new [B, depth, D]
+        x      : [B, 1]       token indices
+        h_prev : [B, depth, 2, D]  complex — [:, i, 0] = scout, [:, i, 1] = true
+        returns: logits [B, 1, V], h_new [B, depth, 2, D]
         """
         z        = self.embed(x).squeeze(1)                            # [B, D]
         z_prev   = torch.zeros_like(z)
@@ -438,7 +468,7 @@ class ContinuousTransformer(nn.Module):
             z, h_i = self.operators[i].forward_step(z_in, h_prev[:, i], z_prev=z_prev)
             z_prev = z
             h_layers.append(h_i)
-        h_new  = torch.stack(h_layers, dim=1)                          # [B, depth, D]
+        h_new  = torch.stack(h_layers, dim=1)                          # [B, depth, 2, D]
         logits = self.out_proj(z).unsqueeze(1)                         # [B, 1, V]
         return logits, h_new
 
@@ -455,8 +485,8 @@ def generate(model: nn.Module, prompt: str, device: str = "cuda",
     tokens = [ord(c) for c in prompt]
     print(f"\nGeneration (O(1) recurrent): {prompt}", end="", flush=True)
 
-    # Initialize empty wave fields for all depth layers
-    h = torch.zeros(1, model.depth, model.dim, dtype=torch.complex64, device=device)
+    # Initialize empty wave fields for all depth layers (scout + true per layer)
+    h = torch.zeros(1, model.depth, 2, model.dim, dtype=torch.complex64, device=device)
 
     # Encode the prompt by stepping through it token by token
     for tok in tokens:
