@@ -171,6 +171,47 @@ def prepare_openhermes_dataset(cache_dir: str = "~/.cache/continuous_transformer
     return out_path
 
 
+def prepare_wikipedia_dataset(cache_dir: str = "~/.cache/continuous_transformer") -> str:
+    """
+    Download English Wikipedia (20220301.en) and flatten to a single ASCII text file.
+    Each article becomes:
+        = Title =\n\n{body text}\n\n
+    All non-ASCII bytes are dropped so VOCAB_SIZE=256 remains valid.
+    ~3.5GB on disk after flattening — richer and more linguistically diverse
+    than OpenHermes for pretraining from scratch.
+    Pairs of Wikipedia sections give coherent long-form prose: good for
+    exercising the wave memory at L=1024/2048 in the seqlen curriculum.
+    """
+    cache_dir = os.path.expanduser(cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+    out_path  = os.path.join(cache_dir, "wikipedia_train.txt")
+    if os.path.exists(out_path):
+        print(f"Using cached dataset: {out_path} ({os.path.getsize(out_path)/1e6:.1f} MB)")
+        return out_path
+
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError("Run: pip install datasets")
+
+    print("Downloading Wikipedia 20231101.en — this may take 10-20 minutes...")
+    ds = load_dataset("wikimedia/wikipedia", "20231101.en", split="train")
+    print(f"Downloaded {len(ds)} articles. Flattening to text...")
+
+    with open(out_path, "w", encoding="ascii", errors="ignore") as f:
+        for row in ds:
+            title = row.get("title", "").strip()
+            text  = row.get("text",  "").strip()
+            if not text:
+                continue
+            # WikiText-style heading so slow wave layers can learn document structure
+            f.write(f" = {title} = \n\n{text}\n\n")
+
+    size = os.path.getsize(out_path)
+    print(f"Saved: {out_path} ({size/1e6:.1f} MB)")
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Math utilities  (verbatim from init commit)
 # ---------------------------------------------------------------------------
@@ -285,6 +326,9 @@ class SchrodingerAttention(nn.Module):
         band_size = dim // n_bands
         bands     = order.view(n_bands, band_size)            # [K, D/K] indices
         self.register_buffer('band_idx', bands)               # [K, D/K] long
+        # Inverse permutation: undoes the band reordering in O(1) via gather.
+        # Eliminates the torch.zeros(D) + scatter pattern in forward_step.
+        self.register_buffer('inv_band_idx', torch.argsort(bands.flatten()))  # [D]
 
         # ── Dual Wave B coupling + scalar write gate ─────────────────────
         # Scout B (to_B_scout): input-only LTI. Runs first, feels the sequence shape.
@@ -331,15 +375,19 @@ class SchrodingerAttention(nn.Module):
             torch.eye(mimo_p).unsqueeze(0).expand(G_mimo, -1, -1).clone()
             + 0.02 * torch.randn(G_mimo, mimo_p, mimo_p)
         )
+        self._A_cache = None   # invalidated by ContinuousTransformer.invalidate_A_cache()
 
     # ------------------------------------------------------------------
     def _A(self) -> torch.Tensor:
-        """Constant evolution factor A = exp((-γ + iω)·|dt|)  [D]  complex"""
-        dt = self.dt.abs()
-        return torch.exp(torch.complex(
-            -torch.exp(self.log_gamma) * dt,
-            self.omega * dt,
-        ))
+        """Cached evolution factor A = exp((-γ + iω)·|dt|)  [D]  complex.
+        Valid between optimizer steps; call invalidate_A_cache() after step()."""
+        if self._A_cache is None:
+            dt = self.dt.abs()
+            self._A_cache = torch.exp(torch.complex(
+                -torch.exp(self.log_gamma) * dt,
+                self.omega * dt,
+            ))
+        return self._A_cache
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor,
@@ -428,8 +476,9 @@ class SchrodingerAttention(nn.Module):
         # tau=1 at init → soft competition. Sharpens as bands specialise.
         # Phase preserved — only magnitude |alpha| determines the winner.
         # *K restores total energy (softmax sums to 1, not K).
-        c_k      = F.softmax(alpha.abs() / self.tau.clamp(min=1e-4), dim=2)  # [B, L, K, 1]
-        alpha_ig = alpha * c_k * K                                            # [B, L, K, 1]
+        tau_eff  = F.softplus(self.tau).clamp(min=0.1)                          # always positive, min 0.1 → max 10× amplification
+        c_k      = F.softmax(alpha.abs() / tau_eff, dim=2)                      # [B, L, K, 1]
+        alpha_ig = alpha * c_k * K                                              # [B, L, K, 1]
 
         # Self-model: per-band Born-rule density |h_k|² / (D/K).
         # Each band reports its own self-confidence, not the global field.
@@ -508,13 +557,15 @@ class SchrodingerAttention(nn.Module):
         Hb  = h_read[:, bx]                                            # [B, K, D/K]
         Pb  = phi[:, bx]
         alpha    = (Hb.conj() * Pb).sum(-1, keepdim=True) / (D // K)  # [B, K, 1]
-        c_k      = F.softmax(alpha.abs() / self.tau.clamp(min=1e-4), dim=1)  # [B, K, 1]
+        tau_eff  = F.softplus(self.tau).clamp(min=0.1)                      # positive, ≥0.1
+        c_k      = F.softmax(alpha.abs() / tau_eff, dim=1)                  # [B, K, 1]
         alpha_ig = alpha * c_k * K
         density  = (Hb.real**2 + Hb.imag**2).mean(-1, keepdim=True)   # [B, K, 1]
         alpha_fin = alpha_ig + self.beta * density
         out_bands = (Hb * alpha_fin).real
-        out = torch.zeros(Bsz, D, device=x.device)
-        out[:, bx] = out_bands
+        # Inverse permutation gather — same result as zeros+scatter but no allocation.
+        # band_idx partitions all D channels, so inv_band_idx covers [0..D-1] exactly.
+        out = out_bands.view(Bsz, D)[:, self.inv_band_idx]             # [B, D]
         # MIMO grouped mixing — matches forward() exactly
         G, P = D // self.mimo_p, self.mimo_p
         out = torch.einsum('gpq,bgq->bgp', self.mimo_w, out.reshape(Bsz, G, P)).reshape(Bsz, D)
@@ -561,6 +612,13 @@ class ContinuousTransformer(nn.Module):
             z_prev = z   # this layer's output = next layer's prediction
         logits = self.out_proj(z)                                       # [B, L, V]
         return logits, z
+
+    def invalidate_A_cache(self) -> None:
+        """Call after optimizer.step(). Forces _A() to recompute from updated params.
+        Without this, all forward_step calls within a collect+replay cycle share
+        the same cached A tensor — 12,288 exp() calls → 6."""
+        for op in self.operators:
+            op._A_cache = None
 
     def forward_step(self, x: torch.Tensor, h_prev: torch.Tensor):
         """
@@ -715,7 +773,7 @@ def train(checkpoint_prefix: str = "continuous_transformer"):
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    data_path  = prepare_openhermes_dataset()
+    data_path  = prepare_wikipedia_dataset()
     # Dataset always loads MAX_SEQ_LENGTH; variable_collate_fn truncates each
     # batch to a length sampled from SEQ_SCHEDULE before it hits the model.
     dataset    = TinyStoriesDataset(data_path, seq_length=MAX_SEQ_LENGTH, stride=256)
