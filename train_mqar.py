@@ -72,7 +72,7 @@ VOCAB  = 128
 N_KEYS = 64      # key tokens  → IDs [0,  64)
 N_VALS = 64      # value tokens → IDs [64, 128)
 
-DIM   = 256
+DIM   = 64
 DEPTH = 4
 # Per-layer wave-field widths.  Deep/slow layers get more complex slots so that
 # 64 KV pairs can sit in well-separated regions of the state space.
@@ -80,7 +80,7 @@ DEPTH = 4
 # With 64 keys the per-key ceiling is: 256→92%  512→98%  1024→≈100%
 # dim=64: residual highway is narrow but FFN is 16× cheaper than dim=256.
 # batch_scale=1024//64=16 → micro-batch=2, accum=16 → eff. batch=32.
-STATE_DIMS = [256, 256, 512, 1024]   # L0 fast-syntax  →  L3 KV-vault
+STATE_DIMS = [256, 256, 512, int(1024*1.5)]   # L0 fast-syntax  →  L3 KV-vault
 
 LR        = 3e-4
 GRAD_CLIP = 1.0

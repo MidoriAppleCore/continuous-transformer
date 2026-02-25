@@ -17,8 +17,8 @@ Generation O(1)       — true recurrent forward_step, infinite context
 # ---------------------------------------------------------------------------
 # Hyper-parameters
 # ---------------------------------------------------------------------------
-DIM            = int(1024*1.25)
-DEPTH          = 8
+DIM            = int(512)
+DEPTH          = 4
 VOCAB_SIZE     = 256
 MIMO_P         = 8     # MIMO group size — channels mix in groups of P (P×P matmul)
 
@@ -54,11 +54,14 @@ GEN_TOP_P       = 0.9
 import math, os, glob, mmap, urllib.request
 import numpy as np
 import torch
+from scipy.fft import next_fast_len
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.checkpoint import checkpoint
+
+torch.set_float32_matmul_precision('high')
 
 # ---------------------------------------------------------------------------
 # Dataset  (verbatim from init commit)
@@ -309,6 +312,9 @@ class SchrodingerAttention(nn.Module):
         SD = self.state_dim = state_dim if state_dim is not None else dim
         self.n_bands = n_bands   # spectral bands: each reads SD/K independent modes
         assert SD % n_bands == 0, f"state_dim={SD} must be divisible by n_bands={n_bands}"
+        # Scout is capped at model dim. Deep layers (SD=1024, dim=256) run the scout
+        # at 256 channels — 4× fewer FFT channels, 4× cheaper scout FFT.
+        ScoutDim = self.scout_dim = min(dim, SD)
 
         # ── Wave physics ──────────────────────────────────────────────────
         self.omega     = nn.Parameter(hippo_freqs(SD))         # [SD] HiPPO rotation
@@ -329,11 +335,25 @@ class SchrodingerAttention(nn.Module):
         inv_sp_dt      = math.log(math.expm1(target_dt))       # softplus⁻¹
         self.dt        = nn.Parameter(torch.tensor(inv_sp_dt, dtype=torch.float32))
 
+        # ── Scout Wave physics (independent small-state SSM) ─────────────
+        # ScoutDim = min(dim, SD): bottlenecked so scout FFT is never wider than dim.
+        # Own parameters so scout can specialise for local syntax independently.
+        # ~2*ScoutDim+1 extra params per layer — negligible.
+        self.omega_scout     = nn.Parameter(hippo_freqs(ScoutDim))
+        self.log_gamma_scout = nn.Parameter(torch.randn(ScoutDim) * 0.5 - 7.0)
+        self.dt_scout        = nn.Parameter(torch.tensor(inv_sp_dt, dtype=torch.float32))
+        _scout_order   = torch.argsort(hippo_freqs(ScoutDim), descending=False)
+        _unitary_scout = torch.zeros(ScoutDim, dtype=torch.bool)
+        _unitary_scout[_scout_order[:ScoutDim // n_bands]] = True
+        self.register_buffer('unitary_mask_scout', _unitary_scout)
+
         # ── Token → wave projections ──────────────────────────────────────
         self.to_psi = nn.Linear(dim, SD * 2)    # excitation wave  ψ (content → wave field)
         nn.init.orthogonal_(self.to_psi.weight)  # orthogonal write basis: key tokens span separate subspaces
         self.to_phi = nn.Linear(dim, SD * 2)    # measurement wave φ (read  → wave field)
         nn.init.orthogonal_(self.to_phi.weight)  # complete orthonormal basis at t=0
+        self.to_psi_scout = nn.Linear(dim, ScoutDim * 2)    # Scout ψ — bottlenecked width
+        nn.init.orthogonal_(self.to_psi_scout.weight)
 
         # ── HiPPO-aligned band boundaries ────────────────────────────────
         # hippo_freqs returns exp(-sqrt(2n+1)/max · log10000), monotone ↓ in n.
@@ -371,37 +391,34 @@ class SchrodingerAttention(nn.Module):
         # Both inited: zero weight, bias = softplus_inv(hippo_b_vector).
         #   softplus(W·0) == hippo_b_vector — starts from the HiPPO optimum.
         # write_gate: shared SCALAR — controls WHEN to write (both waves).
-        b0 = hippo_b_vector(SD)                           # [SD] target at zero input
-        b0_inv = torch.log(torch.exp(b0.clamp(min=1e-6)) - 1.0)  # softplus⁻¹
-        self.to_B_scout = nn.Linear(dim, SD)              # Scout: input-only coupling
+        b0_true     = hippo_b_vector(SD)                          # [SD] true wave target
+        b0_true_inv = torch.log(torch.exp(b0_true.clamp(min=1e-6)) - 1.0)
+        b0_scout    = hippo_b_vector(ScoutDim)                     # [ScoutDim] scout target
+        b0_scout_inv = torch.log(torch.exp(b0_scout.clamp(min=1e-6)) - 1.0)
+        self.to_B_scout = nn.Linear(dim, ScoutDim)                 # Scout: bottlenecked coupling
         nn.init.zeros_(self.to_B_scout.weight)
-        self.to_B_scout.bias.data.copy_(b0_inv)
-        self.to_B_true_x = nn.Linear(dim, SD)             # True: input path (no concat)
+        self.to_B_scout.bias.data.copy_(b0_scout_inv)
+        self.to_B_true_x = nn.Linear(dim, SD)                      # True: input path
         nn.init.zeros_(self.to_B_true_x.weight)
-        self.to_B_true_x.bias.data.copy_(b0_inv)          # softplus(b0_inv)=hippo_b at init
-        self.to_B_true_h = nn.Linear(SD * 2, SD)          # True: scout state path
+        self.to_B_true_x.bias.data.copy_(b0_true_inv)
+        self.to_B_true_h = nn.Linear(ScoutDim * 2, SD)             # Bouncer: scout→SD (bottlenecked)
         nn.init.zeros_(self.to_B_true_h.weight)
-        nn.init.zeros_(self.to_B_true_h.bias)             # zero init — adds nothing at start
-        # Phase-selective writing — the "Schrödinger" upgrade.
-        # B_t = amp · e^{i·θ(x_t)} instead of amp + 0·i.
-        #
-        # ── Phase projections (warm-start: uniform random, trainable) ───────────
-        # Initialise to_phase_scout and to_phase_true_x with scaled uniform weights.
-        # Weight scale 1/√dim: keeps pre-tanh std ≈ 1 given N(0,1) token embeddings,
-        # so diversity is present from step 0 without saturating tanh.
-        # These are trainable — co-adaptation with to_psi/to_phi is required.
-        # Freezing them (previous attempt) collapsed L1 dt→0 because the optimizer
-        # found it easier to bypass the wave than to match frozen random phases.
+        nn.init.zeros_(self.to_B_true_h.bias)
+        # Phase-selective writing — Transcendental Bypass:
+        # Linear → F.normalize(p=2, dim=-1) instead of tanh → cos/sin.
+        # Eliminates 3 GPU trig kernels (tanh, cos, sin) per wave per step.
+        # Both paths produce identical unit-magnitude complex phasors — math unchanged.
+        # Output size doubles (2 channels per mode: cos_raw, sin_raw) so F.normalize
+        # snaps the 2D vector to the unit circle in pure MAC operations.
+        # Phase remains strictly input-only for scout and true — holographic key intact.
         _phase_w_scale = 1.0 / math.sqrt(dim)
-        self.to_phase_scout  = nn.Linear(dim, SD)          # input → write phase (scout)
+        self.to_phase_scout  = nn.Linear(dim, ScoutDim * 2)  # bypass: [dim → ScoutDim×2]
         nn.init.uniform_(self.to_phase_scout.weight, -_phase_w_scale, _phase_w_scale)
-        nn.init.zeros_(self.to_phase_scout.bias)           # bias=0: diversity from W×token only
-        self.to_phase_true_x = nn.Linear(dim, SD)          # input → write phase (true)
+        nn.init.zeros_(self.to_phase_scout.bias)
+        self.to_phase_true_x = nn.Linear(dim, SD * 2)        # bypass: [dim → SD×2]
         nn.init.uniform_(self.to_phase_true_x.weight, -_phase_w_scale, _phase_w_scale)
-        nn.init.zeros_(self.to_phase_true_x.bias)          # bias=0: diversity from W×token only
-        self.to_phase_true_h = nn.Linear(SD * 2, SD)       # scout state → write phase (true)
-        nn.init.zeros_(self.to_phase_true_h.weight)
-        nn.init.zeros_(self.to_phase_true_h.bias)
+        nn.init.zeros_(self.to_phase_true_x.bias)
+        # to_phase_true_h removed — phase_true is strictly input-only (no state dependency)
         self.write_gate = nn.Linear(dim, 1)   # scalar gate — WHEN to write
         self.surprise_gain = nn.Parameter(torch.zeros(1))  # predictive coding depth
         self.tau  = nn.Parameter(torch.ones(1))   # ignition temperature (init=1 → soft)
@@ -423,7 +440,8 @@ class SchrodingerAttention(nn.Module):
         # Output projection: maps wave field [SD] → model dim [dim].
         # nn.Identity when SD == dim (default — zero extra params).
         self.out_proj = nn.Linear(SD, dim, bias=False) if SD != dim else nn.Identity()
-        self._A_cache = None   # invalidated by ContinuousTransformer.invalidate_A_cache()
+        self._A_cache       = None   # invalidated by ContinuousTransformer.invalidate_A_cache()
+        self._A_scout_cache = None   # same — scout uses separate physics
 
     # ------------------------------------------------------------------
     def _A(self) -> torch.Tensor:
@@ -440,6 +458,14 @@ class SchrodingerAttention(nn.Module):
             ))
         return self._A_cache
 
+    def _A_scout(self) -> torch.Tensor:
+        """Cached evolution factor for the bottlenecked scout wave [ScoutDim] complex."""
+        if self._A_scout_cache is None:
+            dt = F.softplus(self.dt_scout)
+            gamma_eff = F.softplus(self.log_gamma_scout) * (~self.unitary_mask_scout).float()
+            self._A_scout_cache = torch.exp(torch.complex(-gamma_eff * dt, self.omega_scout * dt))
+        return self._A_scout_cache
+
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor,
                z_prev: torch.Tensor | None = None) -> torch.Tensor:
@@ -454,8 +480,9 @@ class SchrodingerAttention(nn.Module):
         z_prev : [B, L, D]  previous layer's output (predictive coding signal)
         returns: [B, L, D]  real
         """
-        B, L, D = x.shape
-        SD = self.state_dim       # wave field width — may differ from model dim D
+        B, L, D  = x.shape
+        SD       = self.state_dim    # true wave field width
+        ScoutDim = self.scout_dim    # scout wave width — capped at dim, ≤ SD
 
         psi_raw = self.to_psi(x).float()                                # fp32 — complex64 needs float32 parts
         psi     = torch.complex(psi_raw[..., :SD], psi_raw[..., SD:])  # [B, L, SD]
@@ -469,55 +496,52 @@ class SchrodingerAttention(nn.Module):
         if z_prev is not None:
             surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, L, 1]
             gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
-        # ── Dual Wave: shared kernel ──────────────────────────────────────
-        dt        = F.softplus(self.dt)   # consistent with _A() — always positive
-        gamma_eff = F.softplus(self.log_gamma) * (~self.unitary_mask).float()  # zero for unitary dims
-        lam       = torch.complex(-gamma_eff, self.omega)  # [SD] unitary dims: pure rotation
+        # ── True Wave kernel (SD dims, Simpson's folded in) ──────────────────
+        dt        = F.softplus(self.dt)
+        gamma_eff = F.softplus(self.log_gamma) * (~self.unitary_mask).float()
+        lam       = torch.complex(-gamma_eff, self.omega)
         t_axis    = torch.arange(L, device=x.device, dtype=torch.float32)
-        kernel_raw = torch.exp(lam.unsqueeze(0) * t_axis.unsqueeze(1) * dt) # [L, SD]
-
-        # Fold Simpson's Rule into the kernel — exploits conv associativity:
-        #   (U * Simpson_filter) * K  ≡  U * (Simpson_filter * K)
-        # kernel_raw is [L, SD] (no batch dim), so the 3-tap blend costs B× less
-        # VRAM than blending the full [B, L, SD] U tensor.  Mathematically identical.
+        kernel_raw = torch.exp(lam.unsqueeze(0) * t_axis.unsqueeze(1) * dt)  # [L, SD]
         k_zeros        = torch.zeros(2, SD, dtype=kernel_raw.dtype, device=x.device)
-        k_pad          = torch.cat([k_zeros, kernel_raw], dim=0)          # [L+2, SD]
+        k_pad          = torch.cat([k_zeros, kernel_raw], dim=0)
         kernel_simpson = (1/6)*k_pad[2:] + (4/6)*k_pad[1:-1] + (1/6)*k_pad[:-2]  # [L, SD]
 
-        n_fft        = 1 << (2 * L - 1).bit_length()   # next power-of-2 ≥ 2L — cuFFT fast path
-        K_freq_scout = torch.fft.fft(kernel_raw.T,     n=n_fft, dim=1)   # [SD, n_fft] Euler
-        K_freq_true  = torch.fft.fft(kernel_simpson.T, n=n_fft, dim=1)   # [SD, n_fft] Simpson's
+        # ── Scout Wave kernel (ScoutDim ≤ SD, independent physics) ───────────
+        # Bottlenecked: deep layers run scout at dim=256 instead of SD=1024 — 4× cheaper.
+        dt_s         = F.softplus(self.dt_scout)
+        gamma_eff_s  = F.softplus(self.log_gamma_scout) * (~self.unitary_mask_scout).float()
+        lam_s        = torch.complex(-gamma_eff_s, self.omega_scout)
+        kernel_scout = torch.exp(lam_s.unsqueeze(0) * t_axis.unsqueeze(1) * dt_s)  # [L, ScoutDim]
 
-        # ── 1. Scout Wave (input-only LTI — runs first) ───────────────────
-        b_scout     = F.softplus(self.to_B_scout(x).float())               # [B, L, D]
-        phase_scout = math.pi * torch.tanh(self.to_phase_scout(x).float()) # [B, L, D] ∈(-π,π)
-        B_c_scout   = torch.complex(b_scout * torch.cos(phase_scout),
-                                    b_scout * torch.sin(phase_scout))      # amp·e^{iθ}
-        U_scout   = gate * B_c_scout * psi                                # [B, L, D]
+        n_fft        = next_fast_len(2 * L - 1)   # 5-smooth ≥ 2L-1 — cuFFT fast path
+        K_freq_scout = torch.fft.fft(kernel_scout.T, n=n_fft, dim=1)   # [ScoutDim, n_fft]
+        K_freq_true  = torch.fft.fft(kernel_simpson.T, n=n_fft, dim=1)  # [SD, n_fft]
+
+        # ── 1. Scout Wave (bottlenecked LTI — ScoutDim channels) ─────────────
+        psi_s_raw  = self.to_psi_scout(x).float()
+        psi_scout  = torch.complex(psi_s_raw[..., :ScoutDim], psi_s_raw[..., ScoutDim:])  # [B, L, ScoutDim]
+        b_scout    = F.softplus(self.to_B_scout(x).float())                  # [B, L, ScoutDim]
+        # Transcendental Bypass: Linear→normalize vs tanh→cos/sin — identical unit phasors.
+        ph_s_raw   = self.to_phase_scout(x).float().view(B, L, ScoutDim, 2)  # [B, L, ScoutDim, 2]
+        ph_s       = F.normalize(ph_s_raw, p=2, dim=-1)                      # unit 2D vectors
+        B_c_scout  = torch.complex(b_scout * ph_s[..., 0], b_scout * ph_s[..., 1])
+        U_scout    = gate * B_c_scout * psi_scout                            # [B, L, ScoutDim]
         U_freq_scout = torch.fft.fft(U_scout.permute(0, 2, 1), n=n_fft, dim=2)
-        H_scout   = torch.fft.ifft(
+        H_scout    = torch.fft.ifft(
             U_freq_scout * K_freq_scout.unsqueeze(0), n=n_fft, dim=2
-        )[:, :, :L].permute(0, 2, 1)                                     # [B, L, D]
+        )[:, :, :L].permute(0, 2, 1)                                         # [B, L, ScoutDim]
 
         # ── 2. Smart Bouncer — causal state-dependent B for the true wave ─
-        # H_scout_prev[t] = H_scout[t-1]: what the scout knew *before* step t.
-        H_scout_prev = F.pad(H_scout, (0, 0, 1, 0))[:, :-1, :]          # [B, L, D]
-        # Normalise before feeding to B-coupling: prevents cascade amplification.
-        # Complex RMSNorm: scale by overall magnitude so the phase angle is preserved exactly.
-        # LayerNorm(Re) / LayerNorm(Im) independently stretch the axes, converting the
-        # unit circle into a random ellipse each step — that would corrupt all stored phases.
+        H_scout_prev   = F.pad(H_scout, (0, 0, 1, 0))[:, :-1, :]        # [B, L, ScoutDim]
         scout_rms      = (H_scout_prev.real**2 + H_scout_prev.imag**2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
-        H_scout_prev_n = H_scout_prev / scout_rms                        # [B, L, SD] unit-phasor-scaled
-        H_prev_flat    = torch.cat([H_scout_prev_n.real, H_scout_prev_n.imag], dim=-1)  # [B, L, 2*SD]
+        H_scout_prev_n = H_scout_prev / scout_rms                        # [B, L, ScoutDim] unit-phasor-scaled
+        H_prev_flat    = torch.cat([H_scout_prev_n.real, H_scout_prev_n.imag], dim=-1)  # [B, L, 2*ScoutDim]
         b_true     = F.softplus(self.to_B_true_x(x).float() + self.to_B_true_h(H_prev_flat).float())
-        # Phase must be STRICTLY input-dependent so the write key is identical at
-        # query time regardless of what the scout wave has seen since the KV pair.
-        # State-dependent phase would encrypt each write with a context password that
-        # changes over time — making retrieval impossible at long range.
-        # State still controls AMPLITUDE (b_true) for Mamba-style selectivity.
-        phase_true = math.pi * torch.tanh(self.to_phase_true_x(x).float())  # [B, L, SD]
-        B_c_true   = torch.complex(b_true * torch.cos(phase_true),
-                                    b_true * torch.sin(phase_true))        # amp·e^{iθ}
+        # Phase: strictly input-only (no state) — holographic write key unchanged at query time.
+        # Transcendental Bypass: same unit phasors, zero trig kernels.
+        ph_t_raw   = self.to_phase_true_x(x).float().view(B, L, SD, 2)  # [B, L, SD, 2]
+        ph_t       = F.normalize(ph_t_raw, p=2, dim=-1)                  # [B, L, SD, 2] unit vectors
+        B_c_true   = torch.complex(b_true * ph_t[..., 0], b_true * ph_t[..., 1])
 
         # ── 3. True Wave — kernel-folded Simpson's (no batch-dim allocation) ──
         # Simpson's is already baked into K_freq_true via conv associativity.
@@ -568,7 +592,7 @@ class SchrodingerAttention(nn.Module):
         # to_phi is still used above for alpha ("how much of key k is in H?").
         # Using Q_phase here makes write-key == read-key by construction; the
         # optimizer no longer needs to discover the conjugate of to_phase_true_x.
-        Q_phase        = torch.complex(torch.cos(phase_true), torch.sin(phase_true))  # [B, L, SD]
+        Q_phase        = torch.complex(ph_t[..., 0], ph_t[..., 1])  # [B, L, SD] — reuse bypass phasors
         unbound        = Hb * Q_phase[:, :, bx].conj()                  # [B, L, K, SD/K]
         unbound_scaled = unbound * alpha_fin.abs()                       # [B, L, K, SD/K]
         out_bands      = unbound_scaled.real + unbound_scaled.imag       # [B, L, K, SD/K]
@@ -597,8 +621,9 @@ class SchrodingerAttention(nn.Module):
         z_prev : [B, D]     previous layer output (predictive coding)
         returns: out [B, D] real, h_next [B, 4, D] complex
         """
-        D  = self.dim
-        SD = self.state_dim       # wave field width
+        D        = self.dim
+        SD       = self.state_dim    # true wave field width
+        ScoutDim = self.scout_dim    # scout wave width — capped at dim, ≤ SD
 
         psi_raw = self.to_psi(x).float()
         psi     = torch.complex(psi_raw[..., :SD], psi_raw[..., SD:])  # [B, SD]
@@ -610,34 +635,39 @@ class SchrodingerAttention(nn.Module):
             surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, 1]
             gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
 
-        # Unpack: h_prev is [B, 4, D] — scout, true, U_{t-1}, U_{t-2}
-        h_prev_scout = h_prev[:, 0, :]   # [B, D] complex
-        h_prev_true  = h_prev[:, 1, :]   # [B, D] complex
-        h_prev_U1    = h_prev[:, 2, :]   # [B, D] U_{t-1}
-        h_prev_U2    = h_prev[:, 3, :]   # [B, D] U_{t-2}
+        # Unpack: h_prev is [B, 4, SD] — scout uses first ScoutDim channels of slot 0
+        h_prev_scout = h_prev[:, 0, :ScoutDim]   # [B, ScoutDim] complex
+        h_prev_true  = h_prev[:, 1, :]            # [B, SD] complex
+        h_prev_U1    = h_prev[:, 2, :]            # [B, SD] U_{t-1}
+        h_prev_U2    = h_prev[:, 3, :]            # [B, SD] U_{t-2}
 
-        # 1. Scout step (input-only — matches forward's scout wave)
-        b_scout      = F.softplus(self.to_B_scout(x).float())
-        phase_scout  = math.pi * torch.tanh(self.to_phase_scout(x).float())
-        B_c_scout    = torch.complex(b_scout * torch.cos(phase_scout),
-                                     b_scout * torch.sin(phase_scout))     # amp·e^{iθ}
-        h_next_scout = h_prev_scout * self._A() + gate * B_c_scout * psi  # [B, D]
+        # Scout ψ — bottlenecked excitation
+        psi_s_raw  = self.to_psi_scout(x).float()
+        psi_scout  = torch.complex(psi_s_raw[..., :ScoutDim], psi_s_raw[..., ScoutDim:])  # [B, ScoutDim]
+
+        # 1. Scout step (bottlenecked — matches forward's scout wave)
+        Bsz_step   = x.shape[0]
+        b_scout    = F.softplus(self.to_B_scout(x).float())                       # [B, ScoutDim]
+        ph_s_raw   = self.to_phase_scout(x).float().view(Bsz_step, ScoutDim, 2)   # bypass
+        ph_s       = F.normalize(ph_s_raw, p=2, dim=-1)
+        B_c_scout  = torch.complex(b_scout * ph_s[..., 0], b_scout * ph_s[..., 1])
+        h_next_scout = h_prev_scout * self._A_scout() + gate * B_c_scout * psi_scout  # [B, ScoutDim]
 
         # 2. True step — Simpson's rule: S(U)_t = (1/6)U_t + (4/6)U_{t-1} + (1/6)U_{t-2}
-        # Complex RMSNorm before B-coupling — matches forward() exactly.
         scout_rms    = (h_prev_scout.real**2 + h_prev_scout.imag**2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
-        h_scout_norm = h_prev_scout / scout_rms                          # [B, SD]
-        h_prev_flat  = torch.cat([h_scout_norm.real, h_scout_norm.imag], dim=-1)  # [B, 2*SD]
+        h_scout_norm = h_prev_scout / scout_rms                          # [B, ScoutDim]
+        h_prev_flat  = torch.cat([h_scout_norm.real, h_scout_norm.imag], dim=-1)  # [B, 2*ScoutDim]
         b_true       = F.softplus(self.to_B_true_x(x).float() + self.to_B_true_h(h_prev_flat).float())
-        # Input-only phase — matches forward() exactly (no state-dependent password).
-        phase_true   = math.pi * torch.tanh(self.to_phase_true_x(x).float())
-        B_c_true     = torch.complex(b_true * torch.cos(phase_true),
-                                     b_true * torch.sin(phase_true))       # amp·e^{iθ}
-        U_curr       = gate * B_c_true * psi                              # [B, D] raw U
+        ph_t_raw     = self.to_phase_true_x(x).float().view(Bsz_step, SD, 2)   # bypass
+        ph_t         = F.normalize(ph_t_raw, p=2, dim=-1)                       # [B, SD, 2]
+        B_c_true     = torch.complex(b_true * ph_t[..., 0], b_true * ph_t[..., 1])
+        U_curr       = gate * B_c_true * psi                              # [B, SD]
         U_smooth     = (1/6)*U_curr + (4/6)*h_prev_U1 + (1/6)*h_prev_U2  # Simpson's
-        h_next_true  = h_prev_true * self._A() + U_smooth                 # [B, D]
+        h_next_true  = h_prev_true * self._A() + U_smooth                 # [B, SD]
 
-        h_next = torch.stack([h_next_scout, h_next_true, U_curr, h_prev_U1], dim=1)  # [B, 4, D]
+        # Scout state is ScoutDim; zero-pad to SD so all four slots stack into [B, 4, SD]
+        h_next_scout_full = F.pad(h_next_scout, (0, SD - ScoutDim))      # [B, SD]
+        h_next = torch.stack([h_next_scout_full, h_next_true, U_curr, h_prev_U1], dim=1)  # [B, 4, SD]
 
         # Complex RMSNorm at READ TIME — matches forward() exactly.
         read_rms = (h_next_true.real**2 + h_next_true.imag**2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
@@ -656,8 +686,8 @@ class SchrodingerAttention(nn.Module):
         alpha_ig = alpha * c_k * K
         density  = (Hb.real**2 + Hb.imag**2).mean(-1, keepdim=True)   # [B, K, 1]
         alpha_fin = alpha_ig + self.beta * density
-        # Holographic unbinding — symmetric with forward(): demodulate with write phase.
-        Q_phase        = torch.complex(torch.cos(phase_true), torch.sin(phase_true))  # [B, SD]
+        # Holographic unbinding — reuse bypass phasors (no extra trig kernels)
+        Q_phase        = torch.complex(ph_t[..., 0], ph_t[..., 1])  # [B, SD]
         unbound        = Hb * Q_phase[:, bx].conj()                     # [B, K, SD/K]
         unbound_scaled = unbound * alpha_fin.abs()
         out_bands      = unbound_scaled.real + unbound_scaled.imag
@@ -777,11 +807,11 @@ class ContinuousTransformer(nn.Module):
         return logits, z
 
     def invalidate_A_cache(self) -> None:
-        """Call after optimizer.step(). Forces _A() to recompute from updated params.
-        Without this, all forward_step calls within a collect+replay cycle share
-        the same cached A tensor — 12,288 exp() calls → 6."""
+        """Call after optimizer.step(). Forces _A() and _A_scout() to recompute.
+        Without this, forward_step calls share stale A tensors from before the step."""
         for op in self.operators:
-            op._A_cache = None
+            op._A_cache       = None
+            op._A_scout_cache = None
 
     def forward_step(self, x: torch.Tensor, h_prev: list):
         """
@@ -997,7 +1027,8 @@ def train(checkpoint_prefix: str = "continuous_transformer"):
     # dt params need 30x higher LR: softplus'(softplus_inv(0.001)) ≈ 0.001, so the
     # gradient reaching dt_raw is 1000x smaller than a normal param. weight_decay=0
     # because L2 on a log-timescale param biases it toward 0 (faster decay = forgetting).
-    dt_params   = [op.dt for op in model.operators]
+    dt_params   = [op.dt       for op in model.operators] + \
+                  [op.dt_scout for op in model.operators]
     dt_id_set   = {id(p) for p in dt_params}
     base_params = [p for p in model.parameters()
                    if id(p) not in dt_id_set and p.requires_grad]
@@ -1052,7 +1083,7 @@ def train(checkpoint_prefix: str = "continuous_transformer"):
                     )
 
                 if step % CHECKPOINT_EVERY == 0 and step > start_step:
-                    generate(model, "<|user|>\nTell me a story about a dog.\n<|assistant|>\n", device=str(device))
+                    generate(model, "The capital of France is ", device=str(device))
                     ckpt_path = f"{checkpoint_prefix}_step{step:05d}.pt"
                     torch.save(model.state_dict(), ckpt_path)
                     print(f"Checkpoint saved: {ckpt_path}")
