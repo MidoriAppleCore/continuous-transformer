@@ -155,24 +155,26 @@ class TopDownGate(nn.Module):
         D = patches.shape[-1]
 
         # First frame: wave is zero → nothing to attend to → pass through
-        if h_prev.abs().max() < 1e-6:
+        if all(t.abs().max() < 1e-6 for t in h_prev):
             return patches
 
-        h_deep = h_prev[:, -1, 1, :]                       # [B, D] complex
+        h_wave   = h_prev[-1][:, 1, :]                     # [B, state_dim_last] complex
+        h_deep_r = self.state_proj(h_wave.real)             # [B, D] — projected to model dim
+        h_deep_i = self.state_proj(h_wave.imag)             # [B, D]
 
         # — WHERE to look: complex amplitude as spatial query —
         # Re(h) ≡ the real-amplitude oscillation component that has accumulated
         # over all past frames.  Inner product with patches = resonance score.
         attn = F.softmax(
-            torch.einsum('bd,bnd->bn', h_deep.real, patches) / (D ** 0.5),
+            torch.einsum('bd,bnd->bn', h_deep_r, patches) / (D ** 0.5),
             dim=-1
         )                                                  # [B, 16]
 
         # — WHAT to amplify: phase as FiLM condition —
         # Im(h) ≡ quadrature component — 90° ahead of the real wave.
         # In biology: different oscillatory phases gate encoding vs retrieval.
-        scale     = self.film_scale(h_deep.imag)           # [B, D]
-        shift     = self.film_shift(h_deep.imag)           # [B, D]
+        scale     = self.film_scale(h_deep_i)              # [B, D]
+        shift     = self.film_shift(h_deep_i)              # [B, D]
         modulated = patches * scale.unsqueeze(1) + shift.unsqueeze(1)  # [B, 16, D]
 
         # Spatial attention blends modulated and raw: peaked attn → focused
@@ -201,18 +203,21 @@ class SchrodingerAgent(nn.Module):
     the readout weights → they migrate to wherever the wave actually learned
     the timescale split.  Physics and credit assignment converge together.
     """
-    def __init__(self, dim=256, depth=6, n_actions=4):
+    def __init__(self, dim=256, depth=6, n_actions=4, state_dims=None):
         super().__init__()
         self.dim   = dim
         self.depth = depth
 
-        self.vision    = VisionEncoder(dim=dim, in_channels=6)
-        self.top_down  = TopDownGate(dim=dim)
-        self.vis_proj  = orthogonal_init(nn.Linear(dim, dim), gain=1.0)
+        self.vision   = VisionEncoder(dim=dim, in_channels=6)
+        self.vis_proj = orthogonal_init(nn.Linear(dim, dim), gain=1.0)
 
         self.transformer = ContinuousTransformer(
-            dim=dim, depth=depth, vocab=256, use_checkpoint=False
+            dim=dim, depth=depth, vocab=256, use_checkpoint=False,
+            state_dims=state_dims
         )
+        # top_down created after transformer so it can read transformer.state_dims[-1]
+        self.top_down = TopDownGate(dim=dim,
+                                    last_state_dim=self.transformer.state_dims[-1])
 
         # Physical prior: actor reads fast layers, critic reads slow layers.
         # Gradient on actor_layer_w[i]  ∝  z_layers[i] − z_actor
@@ -230,7 +235,8 @@ class SchrodingerAgent(nn.Module):
         # The True wave h_{t+1}.real = A·h_t.real + input — this head learns
         # the autonomous A·h_t part, i.e. the Koopman operator of the dynamics.
         # Zero input → pure wave prediction. Supervised by the actual next h.
-        self.patch_pred  = orthogonal_init(nn.Linear(dim, dim),       gain=1.0)
+        sd_last = self.transformer.state_dims[-1]
+        self.patch_pred  = orthogonal_init(nn.Linear(sd_last, sd_last), gain=1.0)
 
     def encode_obs(self, obs, h):
         """
@@ -258,15 +264,16 @@ class SchrodingerAgent(nn.Module):
             for i in range(self.depth):
                 z, h_i = self.transformer.operators[i].forward_step(
                     z + self.transformer.depth_emb[i],
-                    h[:, i],
+                    h[i],
                     z_prev=z_prev_layer,     # inter-layer predictive coding
                 )
+                z = self.transformer.ffn[i](z)  # SwiGLU non-linear decode (matches forward_step)
                 z = z.clamp(-10, 10)         # prevent cascading amplification across layers
                 z_prev_layer = z             # this layer's output predicts next layer
                 z_layers[i]  = z
                 h_layers.append(h_i)
-            h = torch.stack(h_layers, dim=1)               # [B, depth, 4, D]
-        return z_layers, h                                 # list[depth×[B,D]], [B,depth,4,D]
+            h = h_layers                                   # list[depth × [B, 4, state_dim_i]]
+        return z_layers, h                                 # list[B,D]×depth, list[B,4,SD_i]×depth
 
     def forward(self, obs, h_prev):
         z_layers, h_next = self.encode_obs(obs, h_prev)
@@ -295,8 +302,7 @@ class SchrodingerAgent(nn.Module):
 
     def init_hidden(self, device):
         # 4-slot state: scout, true, U_{t-1}, U_{t-2} — matches Simpson's forward_step
-        return torch.zeros(1, self.depth, 4, self.dim,
-                           dtype=torch.complex64, device=device)
+        return self.transformer.make_state(1, device=device)
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +392,7 @@ def train(n_steps=200_000, n=128, save_every=2_000, use_real_world=True,
 
         # ── collect ───────────────────────────────────────────────────────
         obs_buf, act_buf, rew_buf, done_buf, old_lp_buf = [], [], [], [], []
-        h_start = h.detach().clone()
+        h_start = [t.detach().clone() for t in h]
 
         for _ in range(n):
             obs_t = obs.to(device)
@@ -410,7 +416,7 @@ def train(n_steps=200_000, n=128, save_every=2_000, use_real_world=True,
             act_buf.append(action)
             rew_buf.append(float(reward))
             done_buf.append(done)
-            h = h_next.detach()
+            h = [t.detach() for t in h_next]
             step += 1
 
         # ── n-step returns ────────────────────────────────────────────────
@@ -430,12 +436,12 @@ def train(n_steps=200_000, n=128, save_every=2_000, use_real_world=True,
 
         # ── advantage normalisation: no-grad pass to collect values ──────
         with torch.no_grad():
-            h_tmp = h_start.clone()
+            h_tmp = [t.clone() for t in h_start]
             vals  = []
             for i in range(n):
                 _, v, h_tmp = agent(obs_buf[i], h_tmp)
                 vals.append(v.squeeze())
-                h_tmp = h_tmp.detach()
+                h_tmp = [t.detach() for t in h_tmp]
         adv_t = returns_t - torch.stack(vals)
         adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
@@ -469,8 +475,8 @@ def train(n_steps=200_000, n=128, save_every=2_000, use_real_world=True,
             # h_r[:,-1,1,:].real = deepest True wave's real part after obs[i].
             # Detach target: we supervise the predictor, not the dynamics.
             world_loss = F.mse_loss(
-                agent.patch_pred(h_r_prev[:, -1, 1, :].real),
-                h_r[:, -1, 1, :].real.detach()
+                agent.patch_pred(h_r_prev[-1][:, 1, :].real),
+                h_r[-1][:, 1, :].real.detach()
             )
             total_loss = (total_loss
                           + pg_loss
@@ -479,7 +485,7 @@ def train(n_steps=200_000, n=128, save_every=2_000, use_real_world=True,
                           + world_coef * world_loss)
             ep_ent += entropy.mean().item()
             if (i + 1) % 8 == 0:
-                h_r = h_r.detach()   # TBPTT-8: gradient unit = 8 frames × 16 tokens
+                h_r = [t.detach() for t in h_r]   # TBPTT-8: gradient unit = 8 frames × 16 tokens
 
         total_loss = total_loss / n
         optimizer.zero_grad()
@@ -526,7 +532,7 @@ def train(n_steps=200_000, n=128, save_every=2_000, use_real_world=True,
         log_r = log_loss = log_g = log_ent = 0.0
 
         if step % save_every < n:
-            path = f"agent_step{step:07d}.pt"
+            path = f"{checkpoint_prefix}_step{step:07d}.pt"
             torch.save({'step': step, 'agent': agent.state_dict(),
                         'optimizer': optimizer.state_dict()}, path)
             print(f"  Saved {path}")
@@ -539,12 +545,20 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description='WSSM Atari Agent')
     p.add_argument('--dummy',  action='store_true', help='Use dummy world (no gym needed)')
     p.add_argument('--ursina', action='store_true', help='Use Ursina 3D gameworld')
-    p.add_argument('--env',    default='ALE/Breakout-v5',
-                   help='Atari env id (default: ALE/Breakout-v5)\n'
-                        'Options: ALE/Pong-v5  ALE/SpaceInvaders-v5\n'
+    p.add_argument('--env',    default='ALE/Seaquest-v5',
+                   help='Atari env id (default: ALE/Seaquest-v5)\n'
+                        'Options: ALE/Breakout-v5  ALE/Pong-v5  ALE/SpaceInvaders-v5\n'
                         '         ALE/Seaquest-v5  ALE/MontezumaRevenge-v5')
-    p.add_argument('--steps',  type=int, default=200_000)
-    p.add_argument('--n',      type=int, default=128, help='n-step rollout length')
+    p.add_argument('--prefix', default='agent_seaquest',
+                   help='Checkpoint filename prefix (default: agent_seaquest).\n'
+                        'Breakout used "agent".  Change when switching envs to avoid\n'
+                        'loading mismatched policy heads.')
+    p.add_argument('--steps',  type=int, default=500_000,
+                   help='Total environment steps (default: 500k for Seaquest)')
+    p.add_argument('--n',      type=int, default=256,
+                   help='n-step rollout length (default: 256).\n'
+                        'Seaquest oxygen cycle ~200-300 frames — n=256 captures\n'
+                        'one full dive-and-surface in a single rollout.')
     args = p.parse_args()
 
     if args.dummy:
@@ -552,4 +566,5 @@ if __name__ == '__main__':
     elif args.ursina:
         train(use_real_world=True,  n_steps=args.steps, n=args.n)
     else:
-        train(use_real_world='gym', n_steps=args.steps, n=args.n, env_id=args.env)
+        train(use_real_world='gym', n_steps=args.steps, n=args.n,
+              env_id=args.env, checkpoint_prefix=args.prefix)
