@@ -1,58 +1,53 @@
 """
-Continuous Transformer — Schrödinger Wave Attention
-====================================================
-Rebuilt from the init commit. SpectralField replaced with SchrodingerAttention.
+Continuous Transformer — Schrödinger Wave SSM  (Time-Series Forecasting)
+=========================================================================
+Same wave physics as the language model. Swapped:
+  - Fixed harmonic basis  →  nn.Linear input projection (real-valued channels)
+  - Vocab logit head      →  direct multi-step forecast head
+  - Cross-entropy loss    →  MSE + MAE
+  - RevIN                 →  reversible instance normalisation (distribution shift)
 
-Physics (per layer, per step):
-  Evolution:     h_t  = h_{t-1} · exp((-γ + iω)·dt)
-  Born rule:     a_t  = σ(W · Re(ψ_t · h_{t-1}*))   ← interference → attention
-  Superposition: h_t  = h_t + a_t · ψ_t
-  Manifold lock: h_t  = exact_projection(Re) + i·exact_projection(Im)
-  Measurement:   out  = Re(h_t · φ_t*)
+Physics (unchanged):
+  Evolution:   h_t = h_{t-1} · exp((-γ + iω)·dt)
+  Born rule:   α_t = spectrometer(h_t, ψ_t)   [pure-amplitude invariant]
+  Fractal FFN: z   = z + FractalRationalMap(CRMSNorm(z))   [Julia-set recurrence]
+  Hadamard:    channel mixing via fixed unitary beam splitter  [zero params]
 
-Training   O(L log L) — parallel FFT convolution (local-conv attention approx)
-Generation O(1)       — true recurrent forward_step, infinite context
+Benchmarks: ETTh1, ETTh2, ETTm1, ETTm2
+Standard prediction lengths: 96 / 192 / 336 / 720
 """
 
 # ---------------------------------------------------------------------------
-# Hyper-parameters  (Micro-Leviathan — < 1M params)
+# Hyper-parameters
 # ---------------------------------------------------------------------------
-DIM            = 64      # Squeezed phase space — fractal basins, not lookup tables
-DEPTH          = 4        # 4 Julia-set iterations across layers
-VOCAB_SIZE     = 256      # Byte-level
-MIMO_P         = 4        # Smaller channel-mixing blocks (128 / 4 = 32 groups)
+DIM          = 16       # Wave-field width
+DEPTH        = 12        # Julia-set iterations
+MIMO_P       = 4        # Hadamard block size
 
-BASE_LR        = 5e-4     # Higher LR — tiny models need more of a kick
-WEIGHT_DECAY   = 0.01
-BATCH_SIZE     = 16        # DIM=128 is 4x smaller; batch=2 gives 4x less VRAM than before
-# Variable sequence length curriculum.
-# Each entry is (seq_len, sampling_probability).
-# Most steps are short (fast + diverse data); rare long steps train memory.
-# MAX_SEQ_LENGTH is derived automatically as the largest entry.
-SEQ_SCHEDULE = [
-    (256,  0.40),   # 40% — fast, maximum data diversity
-    (512,  0.30),   # 30% — sentence / short paragraph
-    (1024, 0.20),   # 20% — multi-paragraph context
-    (2048, 0.10),   # 10% — long context, exercises wave memory
-]
-MAX_SEQ_LENGTH = max(l for l, _ in SEQ_SCHEDULE)
-GRAD_CLIP      = 1.0
+N_CHANNELS   = 7        # ETT has 7 variates; override for other datasets
+CONTEXT_LEN  = 512      # Look-back window
+PRED_LEN     = 96       # Forecast horizon (96 / 192 / 336 / 720)
 
-CHECKPOINT_EVERY = 1000
-PRINT_EVERY      = 100
+BASE_LR      = 1e-3
+WEIGHT_DECAY = 0.01
+BATCH_SIZE   = 4
+GRAD_CLIP    = 1.0
+MAX_EPOCHS   = 100
 
-USE_AMP      = True   # bfloat16 autocast — ~2x on Ampere, ~4x on A100 tensor cores
-NUM_WORKERS  = 4      # DataLoader prefetch workers (set 0 to debug)
+CHECKPOINT_EVERY = 1        # save every N epochs
+PRINT_EVERY      = 50       # steps
 
-GEN_LENGTH      = 300
-GEN_TEMPERATURE = 0.85
-GEN_TOP_P       = 0.9
+USE_AMP    = True
+NUM_WORKERS = 2
+
+DATASET    = "ETTh1"    # ETTh1 | ETTh2 | ETTm1 | ETTm2
 
 # ---------------------------------------------------------------------------
 # Imports
 # ---------------------------------------------------------------------------
-import math, os, glob, mmap, urllib.request
+import math, os, glob, urllib.request
 import numpy as np
+import pandas as pd
 import torch
 from scipy.fft import next_fast_len
 import torch.nn as nn
@@ -63,160 +58,128 @@ from torch.utils.checkpoint import checkpoint
 
 torch.set_float32_matmul_precision('high')
 
+DATA_ROOT  = os.path.expanduser("~/.cache/timeseries")
+
 # ---------------------------------------------------------------------------
-# Dataset  (verbatim from init commit)
+# ETT Dataset  (Electricity Transformer Temperature, Zhou et al. 2021)
 # ---------------------------------------------------------------------------
 
-def prepare_tinystories_dataset(cache_dir: str = "~/.cache/continuous_transformer") -> str:
-    cache_dir = os.path.expanduser(cache_dir)
-    os.makedirs(cache_dir, exist_ok=True)
-    train_path = os.path.join(cache_dir, "tinystories_train.txt")
-    if not os.path.exists(train_path):
-        print("Downloading TinyStories training data...")
-        url = (
-            "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/"
-            "TinyStoriesV2-GPT4-train.txt"
-        )
-        urllib.request.urlretrieve(url, train_path)
-        print(f"Downloaded to {train_path}")
-    file_size = os.path.getsize(train_path)
-    print(f"Using dataset: {train_path} ({file_size/1e6:.1f} MB)")
-    return train_path
+ETT_URLS = {
+    "ETTh1": "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTh1.csv",
+    "ETTh2": "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTh2.csv",
+    "ETTm1": "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTm1.csv",
+    "ETTm2": "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTm2.csv",
+}
+
+# Standard splits (fraction of total rows)
+ETT_SPLITS = {
+    "ETTh1": (0.6, 0.2, 0.2),
+    "ETTh2": (0.6, 0.2, 0.2),
+    "ETTm1": (0.6, 0.2, 0.2),
+    "ETTm2": (0.6, 0.2, 0.2),
+}
 
 
-class TinyStoriesDataset(Dataset):
-    def __init__(self, data_path: str, seq_length: int, stride: int = 512):
-        self.data_path  = data_path
-        self.seq_length = seq_length
-        self.stride     = stride
-        self.file_size  = os.path.getsize(data_path)
-        self.length     = (self.file_size - seq_length - 1) // stride
-        self._file  = None
-        self._mmap  = None
+def prepare_ett_dataset(name: str = "ETTh1", root: str = DATA_ROOT) -> str:
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f"{name}.csv")
+    if not os.path.exists(path):
+        url = ETT_URLS[name]
+        print(f"Downloading {name} from {url} ...")
+        urllib.request.urlretrieve(url, path)
+        print(f"Saved to {path}")
+    return path
 
-    def _ensure_mmap(self):
-        if self._mmap is None:
-            self._file = open(self.data_path, "rb")
-            self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
-        return self._mmap
+
+class ETTDataset(Dataset):
+    """
+    Sliding-window dataset over one ETT split.
+
+    Global standard scaling: mean/std fitted on the TRAINING split only,
+    then applied to all splits. This matches the exact normalisation used by
+    PatchTST, DLinear, TimesNet etc., so MSE numbers are directly comparable.
+    RevIN on top of this handles residual per-instance distribution shift.
+
+    Returns (x, y):
+      x : [context_len, n_channels]  float32  — look-back window (standardised)
+      y : [pred_len,    n_channels]  float32  — forecast target  (standardised)
+    """
+    def __init__(self, name: str, split: str = "train",
+                 context_len: int = CONTEXT_LEN, pred_len: int = PRED_LEN,
+                 root: str = DATA_ROOT,
+                 mean: np.ndarray = None, std: np.ndarray = None):
+        path = prepare_ett_dataset(name, root)
+        df   = pd.read_csv(path, index_col=0, parse_dates=True)
+        data = df.values.astype(np.float32)          # [T, C]
+
+        T = len(data)
+        train_frac, val_frac, _ = ETT_SPLITS[name]
+        n_train = int(T * train_frac)
+        n_val   = int(T * val_frac)
+
+        # Fit scaler on training data only — never look at val/test stats
+        if mean is None or std is None:
+            train_data  = data[:n_train]
+            self.mean_  = train_data.mean(axis=0, keepdims=True)   # [1, C]
+            self.std_   = train_data.std(axis=0,  keepdims=True) + 1e-8
+        else:
+            self.mean_  = mean
+            self.std_   = std
+
+        if split == "train":
+            raw = data[:n_train]
+        elif split == "val":
+            raw = data[n_train : n_train + n_val]
+        else:
+            raw = data[n_train + n_val :]
+
+        # Apply global standardisation: data is now Mean≈0, Std≈1
+        self.data        = (raw - self.mean_) / self.std_
+        self.context_len = context_len
+        self.pred_len    = pred_len
+        self.window      = context_len + pred_len
+        self.n_samples   = max(0, len(self.data) - self.window + 1)
 
     def __len__(self) -> int:
-        return self.length
+        return self.n_samples
 
     def __getitem__(self, idx: int):
-        mm  = self._ensure_mmap()
-        pos = idx * self.stride
-        mm.seek(pos)
-        chunk = mm.read(self.seq_length + 1)
-        try:
-            text = chunk.decode("utf-8", errors="ignore")
-        except Exception:
-            text = chunk.decode("latin-1", errors="ignore")
-        text = "".join(c for c in text if ord(c) < 128)
-        if len(text) < self.seq_length + 1:
-            text = text + " " * (self.seq_length + 1 - len(text))
-        x = torch.tensor([ord(c) for c in text[:self.seq_length]],  dtype=torch.long)
-        y = torch.tensor([ord(c) for c in text[1:self.seq_length+1]], dtype=torch.long)
+        seg = self.data[idx : idx + self.window]          # [window, C]
+        x   = torch.from_numpy(seg[:self.context_len])   # [L, C]
+        y   = torch.from_numpy(seg[self.context_len:])   # [P, C]
         return x, y
-
-    def __del__(self):
-        if self._mmap is not None:
-            self._mmap.close()
-        if self._file is not None:
-            self._file.close()
-
-
-def prepare_openhermes_dataset(cache_dir: str = "~/.cache/continuous_transformer") -> str:
-    """
-    Download OpenHermes-2.5 and flatten to a single UTF-8 text file
-    using the same format as TinyStories so TinyStoriesDataset works unchanged.
-
-    Each conversation becomes:
-        <|user|>\n{prompt}\n<|assistant|>\n{response}\n<|end|>\n\n
-    Multi-turn conversations stack multiple user/assistant pairs before <|end|>.
-    All non-ASCII bytes are dropped so VOCAB_SIZE=256 is still valid.
-    """
-    cache_dir  = os.path.expanduser(cache_dir)
-    os.makedirs(cache_dir, exist_ok=True)
-    out_path   = os.path.join(cache_dir, "openhermes_train.txt")
-    if os.path.exists(out_path):
-        print(f"Using cached dataset: {out_path} ({os.path.getsize(out_path)/1e6:.1f} MB)")
-        return out_path
-
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        raise ImportError("Run: pip install datasets")
-
-    print("Downloading OpenHermes-2.5 (this may take a few minutes)...")
-    ds = load_dataset("teknium/OpenHermes-2.5", split="train")
-    print(f"Downloaded {len(ds)} conversations. Flattening to text...")
-
-    with open(out_path, "w", encoding="ascii", errors="ignore") as f:
-        for row in ds:
-            # Each row has a 'conversations' list of {from, value} dicts
-            convs = row.get("conversations", [])
-            if not convs:
-                continue
-            buf = []
-            for turn in convs:
-                role  = turn.get("from", "").lower()   # 'human' or 'gpt'
-                value = turn.get("value", "").strip()
-                if not value:
-                    continue
-                tag = "<|user|>" if role == "human" else "<|assistant|>"
-                buf.append(f"{tag}\n{value}\n")
-            if buf:
-                f.write("".join(buf) + "<|end|>\n\n")
-
-    size = os.path.getsize(out_path)
-    print(f"Saved: {out_path} ({size/1e6:.1f} MB)")
-    return out_path
-
-
-def prepare_wikipedia_dataset(cache_dir: str = "~/.cache/continuous_transformer") -> str:
-    """
-    Download English Wikipedia (20220301.en) and flatten to a single ASCII text file.
-    Each article becomes:
-        = Title =\n\n{body text}\n\n
-    All non-ASCII bytes are dropped so VOCAB_SIZE=256 remains valid.
-    ~3.5GB on disk after flattening — richer and more linguistically diverse
-    than OpenHermes for pretraining from scratch.
-    Pairs of Wikipedia sections give coherent long-form prose: good for
-    exercising the wave memory at L=1024/2048 in the seqlen curriculum.
-    """
-    cache_dir = os.path.expanduser(cache_dir)
-    os.makedirs(cache_dir, exist_ok=True)
-    out_path  = os.path.join(cache_dir, "wikipedia_train.txt")
-    if os.path.exists(out_path):
-        print(f"Using cached dataset: {out_path} ({os.path.getsize(out_path)/1e6:.1f} MB)")
-        return out_path
-
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        raise ImportError("Run: pip install datasets")
-
-    print("Downloading Wikipedia 20231101.en — this may take 10-20 minutes...")
-    ds = load_dataset("wikimedia/wikipedia", "20231101.en", split="train")
-    print(f"Downloaded {len(ds)} articles. Flattening to text...")
-
-    with open(out_path, "w", encoding="ascii", errors="ignore") as f:
-        for row in ds:
-            title = row.get("title", "").strip()
-            text  = row.get("text",  "").strip()
-            if not text:
-                continue
-            # WikiText-style heading so slow wave layers can learn document structure
-            f.write(f" = {title} = \n\n{text}\n\n")
-
-    size = os.path.getsize(out_path)
-    print(f"Saved: {out_path} ({size/1e6:.1f} MB)")
-    return out_path
 
 
 # ---------------------------------------------------------------------------
-# Math utilities  (verbatim from init commit)
+# RevIN — Reversible Instance Normalisation (Kim et al. 2022)
+# Handles distribution shift: normalise per-instance at input, denorm at output.
+# Learnable affine per channel (2×C params) that survive across domains.
+# ---------------------------------------------------------------------------
+
+class RevIN(nn.Module):
+    def __init__(self, n_channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps    = eps
+        self.weight = nn.Parameter(torch.ones(n_channels))
+        self.bias   = nn.Parameter(torch.zeros(n_channels))
+        self._mean  = None
+        self._std   = None
+
+    def norm(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, L, C] → normalised [B, L, C]"""
+        self._mean = x.mean(dim=1, keepdim=True)               # [B, 1, C]
+        self._std  = x.std(dim=1, keepdim=True) + self.eps    # [B, 1, C]
+        x = (x - self._mean) / self._std
+        return x * self.weight + self.bias
+
+    def denorm(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, P, C] → original scale [B, P, C]"""
+        x = (x - self.bias) / self.weight
+        return x * self._std + self._mean
+
+
+# ---------------------------------------------------------------------------
+# Math utilities
 # ---------------------------------------------------------------------------
 
 def hippo_freqs(dim: int) -> torch.Tensor:
@@ -817,258 +780,326 @@ class SchrodingerAttention(nn.Module):
 # ContinuousTransformer
 # ---------------------------------------------------------------------------
 
-class ContinuousTransformer(nn.Module):
+class WaveForecaster(nn.Module):
     """
-    Depth-stacked SchrodingerAttention layers.
+    Schrödinger Wave SSM for multivariate time-series forecasting.
 
-    forward()       — parallel training,  O(L log L)
-    forward_step()  — recurrent inference, O(1)
+    Channel Independent architecture (CI): each of the C variates is treated
+    as a separate univariate series and passed through the SAME wave physics.
+    The fractal basins learn the universal dynamics of the system, not
+    cross-channel correlations that break under distribution shift.
+
+    Architecture:
+      revin       : RevIN(n_channels) — per-channel instance normalisation
+      input_proj  : Linear(1, dim)    — lift scalar → wave field  (shared)
+      operators   : SchrodingerAttention × depth  (complex SSM + fractal + Hadamard)
+      ffn         : FractalFFN × depth
+      pred_proj   : Linear(dim, pred_len) — project last hidden → horizon  (shared)
+
+    forward(x: [B, L, C]) → pred: [B, pred_len, C]
+
+    Internally: [B, L, C] → [B*C, L, 1] → SSM → [B*C, pred_len] → [B, P, C]
     """
 
-    def __init__(self, dim: int = 256, depth: int = 6, vocab: int = 256,
-                 use_checkpoint: bool = True, state_dims: list = None):
+    def __init__(self, n_channels: int = N_CHANNELS, dim: int = DIM,
+                 depth: int = DEPTH, pred_len: int = PRED_LEN,
+                 use_checkpoint: bool = False, state_dims: list = None):
         super().__init__()
         self.dim            = dim
         self.depth          = depth
+        self.pred_len       = pred_len
+        self.n_channels     = n_channels
         self.use_checkpoint = use_checkpoint
-        # state_dims: per-layer wave field widths. Default = [dim]*depth (unchanged behaviour).
-        # Increase on deep/slow layers for more long-term memory capacity.
-        # Example (depth=4): state_dims=[256, 256, 512, 1024]
-        #   L3 → 512 complex slots vs 128 at default — ideal for game agents and long text.
-        self.state_dims = state_dims if state_dims is not None else [dim] * depth
-        assert len(self.state_dims) == depth, \
-            f"len(state_dims)={len(self.state_dims)} must equal depth={depth}"
 
-        # ── Fixed Spectral Basis (0 parameters) ───────────────────────────
-        # Each byte is a unique physical boundary condition — a superposition of
-        # prime-harmonic oscillators frozen at construction time.
-        # The model never learns 'what A is'; A is defined as a rigid harmonic
-        # signature.  Intelligence lives entirely in the fractal wave dynamics,
-        # not in a lookup table.  Deletes ~vocab×dim params from the model.
-        # Prime frequencies guarantee no harmonic overlap across the 256-byte vocab.
-        _primes = [2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,
-                   59,61,67,71,73,79,83,89,97,101,103,107,109,113,127,131]
-        with torch.no_grad():
-            freqs  = torch.tensor(_primes[:dim // 2], dtype=torch.float32)
-            phases = torch.linspace(0, 2 * math.pi, vocab).unsqueeze(1)  # [V, 1]
-            basis  = torch.cat([
-                torch.sin(phases * freqs),   # [V, dim//2]
-                torch.cos(phases * freqs),   # [V, dim//2]
-            ], dim=-1)                        # [V, dim]
-        self.register_buffer('fixed_basis', basis)  # frozen, moves with .to(device)
-        # Independent physics per layer: each has its own omega, log_gamma, dt.
-        # Layer 0 tends to learn letter-level patterns (fast decay).
-        # Layer depth-1 tends to learn theme-level patterns (slow decay).
+        self.state_dims = state_dims if state_dims is not None else [dim] * depth
+        assert len(self.state_dims) == depth
+
+        # ── Channel-Independent projections ───────────────────────────
+        # Each channel is a univariate scalar lifted into the wave field.
+        # Shared weights across all channels: the physics is universal.
+        self.input_proj = nn.Linear(1, dim)        # scalar → wave field
+
+        # ── RevIN: per-channel instance norm (reversed at output) ─────
+        self.revin = RevIN(n_channels)
+
+        # ── Wave physics (unchanged from language model) ──────────────
         self.operators = nn.ModuleList([
             SchrodingerAttention(dim, mimo_p=MIMO_P, layer_idx=i, depth=depth,
                                  state_dim=self.state_dims[i])
             for i in range(depth)
         ])
-        self.ffn       = nn.ModuleList([
+        self.ffn = nn.ModuleList([
             FractalFFN(dim) for _ in range(depth)
         ])
-        self.out_proj  = nn.Linear(dim, vocab)
+
+        # ── Forecast head (channel-independent) ──────────────────────
+        # Last hidden state [dim] → pred_len scalars.  Shared across channels.
+        self.pred_proj = nn.Linear(dim, pred_len)
 
     def make_state(self, batch: int = 1, device=None,
                    dtype: torch.dtype = torch.complex64) -> list:
-        """Zero initial hidden state for all layers.
-
-        Returns List[Tensor[batch, 4, state_dim_i]] — one tensor per layer.
-        Use this instead of torch.zeros() so per-layer state_dims are respected.
-        Slots per layer:  [0] scout wave  [1] true wave
-                          [2] U_{t-1}     [3] U_{t-2}  (Simpson lags)
-        """
         if device is None:
             device = next(self.parameters()).device
         return [torch.zeros(batch, 4, sd, dtype=dtype, device=device)
                 for sd in self.state_dims]
 
-    def forward(self, x: torch.Tensor):
-        """x: [B, L]  →  logits [B, L, V], z [B, L, D]
-
-        Residual stream z is complex throughout — each layer's fractal FFN
-        is one iteration of the Julia set recurrence. Phase accumulates
-        across layers; the fractal carves progressively finer basins.
-        """
-        z_real = F.embedding(x, self.fixed_basis)                         # [B, L, D] real — fixed harmonic basis
+    def _encode(self, x: torch.Tensor):
+        """Shared encode path. x: [B*C, L, 1] real → z: [B*C, L, D] complex"""
+        z_real = self.input_proj(x)                                    # [B*C, L, D]
         z = torch.complex(z_real.float(),
-                          torch.zeros_like(z_real, dtype=torch.float32)) # [B, L, D] complex
-        z_prev = torch.zeros_like(z_real)   # predictive coding uses real content
+                          torch.zeros_like(z_real, dtype=torch.float32))
+        z_prev = torch.zeros_like(z_real)
         for i in range(self.depth):
-            z_in_real = z.real                 # wave carries its own layer identity via phase history
+            z_in_real = z.real
             if self.training and self.use_checkpoint:
                 wave_out = checkpoint(self.operators[i], z_in_real, z_prev,
                                       use_reentrant=False)
             else:
                 wave_out = self.operators[i](z_in_real, z_prev)
-            z = z + wave_out                                            # complex + complex
-            z = self.ffn[i](z)                                          # fractal iteration
-            z_prev = z.real   # next layer's prediction = real content
-        logits = self.out_proj(z.real)                                   # [B, L, V]
-        return logits, z.real
+            z      = z + wave_out
+            z      = self.ffn[i](z)
+            z_prev = z.real
+        return z
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x    : [B, context_len, C]  raw time-series (globally standardised)
+        → pred: [B, pred_len,    C]  forecast (same scale as input)
+
+        Channel Independent: each variate processed as a separate univariate
+        series through the same wave physics.  RevIN handles per-instance shift.
+        """
+        B, L, C = x.shape
+        x    = self.revin.norm(x)                                      # [B, L, C]
+
+        # ── Channel Independence: [B, L, C] → [B*C, L, 1] ───────────
+        x_ci = x.permute(0, 2, 1).reshape(B * C, L, 1)               # [B*C, L, 1]
+
+        z    = self._encode(x_ci)                                      # [B*C, L, D] complex
+        # Mean-pool over ALL positions — every timestep gets a direct
+        # gradient path. The last state alone is a 64→96+ bottleneck;
+        # pooling lets the head read dynamics from the full context.
+        pooled = z.real.mean(dim=1)                                    # [B*C, D]
+        pred   = self.pred_proj(pooled)                                # [B*C, P]
+
+        # ── Reassemble channels: [B*C, P] → [B, P, C] ────────────────
+        pred = pred.reshape(B, C, self.pred_len).permute(0, 2, 1)    # [B, P, C]
+        pred = self.revin.denorm(pred)                                 # back to per-instance scale
+        return pred
 
     def invalidate_A_cache(self) -> None:
-        """Call after optimizer.step(). Forces _A() and _A_scout() to recompute.
-        Without this, forward_step calls share stale A tensors from before the step."""
         for op in self.operators:
             op._A_cache       = None
             op._A_scout_cache = None
 
-    def forward_step(self, x: torch.Tensor, h_prev: list):
-        """
-        Single-token recurrent step — complex residual stream.
-
-        x      : [B, 1]   token indices
-        h_prev : list     from make_state() or prior step
-        returns: logits [B, 1, V],
-                 h_new  List[Tensor[B, 4, state_dim_i]]
-        """
-        z_real   = F.embedding(x, self.fixed_basis).squeeze(1)          # [B, D] real — fixed harmonic basis
-        z        = torch.complex(z_real.float(),
-                                 torch.zeros_like(z_real, dtype=torch.float32))
-        z_prev   = torch.zeros_like(z_real)
-        h_layers = []
-        for i in range(self.depth):
-            z_in_real = z.real                 # wave carries its own layer identity via phase history
-            wave_out, h_i = self.operators[i].forward_step(
-                z_in_real, h_prev[i], z_prev=z_prev
-            )
-            z = z + wave_out                                           # complex + complex
-            z = self.ffn[i](z)                                         # fractal iteration
-            z_prev = z.real
-            h_layers.append(h_i)
-        logits = self.out_proj(z.real).unsqueeze(1)                     # [B, 1, V]
-        return logits, h_layers
-
 
 # ---------------------------------------------------------------------------
-# Generation — true O(1) infinite context via forward_step
+# Evaluation
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def generate(model: nn.Module, prompt: str, device: str = "cuda",
-             length: int = GEN_LENGTH, temperature: float = GEN_TEMPERATURE,
-             top_p: float = GEN_TOP_P) -> None:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict:
     model.eval()
-    tokens = [ord(c) for c in prompt]
-    print(f"\nGeneration (O(1) recurrent): {prompt}", end="", flush=True)
-
-    # Initialize empty wave fields: scout, true, U_{t-1}, U_{t-2} per layer
-    h = model.make_state(1, device)
-
-    # Encode the prompt by stepping through it token by token
-    for tok in tokens:
-        t = torch.tensor([[tok]], device=device)
-        _, h = model.forward_step(t, h)
-
-    # Autoregressive generation — infinite context, O(1) per step
-    for _ in range(length):
-        t = torch.tensor([[tokens[-1]]], device=device)
-        logits, h = model.forward_step(t, h)
-
-        probs = torch.softmax(logits[0, -1] / temperature, dim=-1)
-        sorted_probs, idx = torch.sort(probs, descending=True)
-        cumsum = torch.cumsum(sorted_probs, dim=0)
-        cutoff = (cumsum > top_p).float()
-        cutoff[1:] = cutoff[:-1].clone()
-        cutoff[0]  = 0
-        probs[idx[cutoff.bool()]] = 0
-        probs = probs / probs.sum()
-
-        next_tok = torch.multinomial(probs, 1).item()
-        tokens.append(next_tok)
-        print(chr(next_tok), end="", flush=True)
-
-    print("\n")
+    total_mse = total_mae = total_n = 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        pred = model(x)                    # [B, P, C]
+        mse  = ((pred - y) ** 2).mean().item()
+        mae  = (pred - y).abs().mean().item()
+        total_mse += mse * x.shape[0]
+        total_mae += mae * x.shape[0]
+        total_n   += x.shape[0]
     model.train()
+    return {"MSE": total_mse / total_n, "MAE": total_mae / total_n}
 
 
 # ---------------------------------------------------------------------------
-# Needle-in-a-Haystack evaluation
+# Training
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def evaluate_niah(model: nn.Module, device: str = "cuda",
-                  n_trials: int = 20,
-                  haystack_len: int = 2000,
-                  needle_key_len: int = 8,
-                  needle_val_len: int = 8,
-                  depths: tuple = (0.1, 0.25, 0.5, 0.75, 0.9)) -> dict:
-    """
-    Synthetic Needle-in-a-Haystack test (byte-level, VOCAB=256 compatible).
+def _dummy_generation() -> None:  # kept so the rest of this placeholder block isn't reached
+    pass
 
-    For each trial and each needle depth:
-      1. Build a haystack of `haystack_len` random printable ASCII bytes.
-      2. Insert "KEY=<key> VALUE=<val>" at position floor(depth * haystack_len).
-      3. Append "Q: VALUE after KEY=<key>? A: " as the query.
-      4. Step through the full context with forward_step (O(1) per token).
-      5. Greedily decode `needle_val_len` tokens and check exact match.
-
-    Returns dict: {depth: accuracy} + 'mean' key.
-    """
-    import random, string
-    model.eval()
-
-    printable = [c for c in string.printable if c.isprintable() and ord(c) < 128
-                 and c not in '<>=\n\r']
-
-    depth_hits   = {d: 0 for d in depths}
-    depth_trials = {d: 0 for d in depths}
-
-    for trial in range(n_trials):
-        # Fresh random key and value for each trial
-        key = ''.join(random.choices(string.ascii_uppercase, k=needle_key_len))
-        val = ''.join(random.choices(string.digits, k=needle_val_len))
-        needle = f"KEY={key} VALUE={val} "
-
-        haystack_chars = random.choices(printable, k=haystack_len)
-
-        for depth in depths:
-            insert_pos = int(depth * haystack_len)
-            chars = haystack_chars[:insert_pos] + list(needle) + haystack_chars[insert_pos:]
-            query = f"Q: VALUE after KEY={key}? A: "
-            full  = "".join(chars) + query
-
-            # Encode as bytes and step through
-            tokens = [ord(c) for c in full if ord(c) < 128]
-            h = model.make_state(1, device)
-            for tok in tokens:
-                t = torch.tensor([[tok]], device=device)
-                _, h = model.forward_step(t, h)
-
-            # Greedy decode val_len tokens
-            decoded = []
-            tok = tokens[-1]
-            for _ in range(needle_val_len):
-                t = torch.tensor([[tok]], device=device)
-                logits, h = model.forward_step(t, h)
-                tok = logits[0, -1].argmax().item()
-                decoded.append(chr(tok) if 32 <= tok < 128 else '?')
-
-            predicted = "".join(decoded)
-            depth_hits[depth]   += int(predicted == val)
-            depth_trials[depth] += 1
-
-    results = {d: depth_hits[d] / depth_trials[d] for d in depths}
-    results['mean'] = sum(results[d] for d in depths) / len(depths)
-
-    print(f"\n── NIAH (haystack={haystack_len}, key={needle_key_len}B, val={needle_val_len}B) ──")
-    for d in depths:
-        bar = "█" * int(results[d] * 20) + "░" * (20 - int(results[d] * 20))
-        print(f"  depth {d:.2f}: {bar}  {results[d]*100:.1f}%")
-    print(f"  mean accuracy: {results['mean']*100:.1f}%\n")
-
-    model.train()
-    return results
+# (The old generate() and evaluate_niah() functions are removed.
+#  Time-series models don't generate text.)
 
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(checkpoint_prefix: str = "continuous_transformer"):
+def train(dataset_name: str = DATASET,
+          context_len: int = CONTEXT_LEN,
+          pred_len:    int = PRED_LEN,
+          checkpoint_prefix: str = "wave_ts"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    train_ds = ETTDataset(dataset_name, "train", context_len, pred_len)
+    # Pass training scaler to val/test — benchmark-correct: no leakage
+    val_ds   = ETTDataset(dataset_name, "val",   context_len, pred_len,
+                          mean=train_ds.mean_, std=train_ds.std_)
+    test_ds  = ETTDataset(dataset_name, "test",  context_len, pred_len,
+                          mean=train_ds.mean_, std=train_ds.std_)
+    print(f"Dataset: {dataset_name}  context={context_len}  pred={pred_len}")
+    print(f"  train={len(train_ds)}  val={len(val_ds)}  test={len(test_ds)} windows")
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=True,
+                              persistent_workers=(NUM_WORKERS > 0))
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=True,
+                              persistent_workers=(NUM_WORKERS > 0))
+    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=True,
+                              persistent_workers=(NUM_WORKERS > 0))
+
+    n_channels = train_ds.data.shape[1]
+    model  = WaveForecaster(n_channels=n_channels, dim=DIM, depth=DEPTH,
+                            pred_len=pred_len).to(device)
+    params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {params:,}  ({params/1e6:.3f}M)")
+
+    # Checkpoint restore
+    checkpoints = sorted(glob.glob(f"{checkpoint_prefix}_epoch*.pt"))
+    start_epoch = 0
+    if checkpoints:
+        latest = checkpoints[-1]
+        print(f"Loading checkpoint: {latest}")
+        try:
+            missing, unexpected = model.load_state_dict(
+                torch.load(latest, map_location=device), strict=False)
+            if missing:    print(f"  New params: {missing}")
+            if unexpected: print(f"  Dropped:    {unexpected}")
+            start_epoch = int(latest.split("epoch")[1].split(".")[0]) + 1
+            print(f"Resuming from epoch {start_epoch}")
+        except Exception as e:
+            print(f"Load failed ({e}). Starting fresh.")
+
+    # dt params need higher LR — same logic as language model
+    dt_params = [op.dt for op in model.operators] + \
+                [op.dt_scout for op in model.operators]
+    dt_id_set = {id(p) for p in dt_params}
+    base_params = [p for p in model.parameters()
+                   if id(p) not in dt_id_set and p.requires_grad]
+    opt = optim.AdamW([
+        {'params': base_params, 'lr': BASE_LR,      'weight_decay': WEIGHT_DECAY},
+        {'params': dt_params,   'lr': BASE_LR * 30, 'weight_decay': 0.0},
+    ], eps=1e-8)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=[BASE_LR, BASE_LR * 30],
+        epochs=MAX_EPOCHS, steps_per_epoch=len(train_loader),
+        pct_start=0.1, anneal_strategy='cos',
+    )
+
+    best_val_mse = float('inf')
+    step = 0
+
+    try:
+        for epoch in range(start_epoch, MAX_EPOCHS):
+            model.train()
+            ema_loss = None   # EMA of physics training loss
+            ema_mse  = None   # EMA of pure MSE (evaluation metric, no gradients)
+            for x, y in train_loader:
+                x, y = x.to(device), y.to(device)
+
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                    enabled=USE_AMP and device.type == 'cuda'):
+                    pred = model(x)                             # [B, P, C]
+
+                    # ── Training objective (full gradient path) ─────────────
+                    # MSE: absolute coordinate anchor (fixes the integration constant).
+                    mse_loss  = F.mse_loss(pred, y)
+
+                    # Sobolev: first-difference penalty — forces correct velocity/shape.
+                    # A flat prediction has Δ=0; if the target oscillates this is brutal.
+                    diff_loss = F.mse_loss(pred[:, 1:] - pred[:, :-1],
+                                           y[:, 1:]    - y[:, :-1])
+
+                    # Spectral: amplitude-spectrum penalty — enforces 24 h / 168 h harmonics.
+                    # Phase-shift-tolerant: rewards correct frequencies, not exact timing.
+                    # norm='ortho' applies 1/√N so FFT amplitudes are on the SAME scale
+                    # as temporal values (Parseval-exact). Without this, |X[k]|≈√(N/2)·σ
+                    # and the 0.01 weight is actually ~0.5 effective — stealing gradient.
+                    pred_fft = torch.fft.rfft(pred.float(), dim=1, norm='ortho').abs()
+                    y_fft    = torch.fft.rfft(y.float(),   dim=1, norm='ortho').abs()
+                    fft_loss = F.mse_loss(pred_fft, y_fft)
+
+                    loss = mse_loss + 0.1 * diff_loss + 0.01 * fft_loss
+
+                    # ── Evaluation metrics (observer only, no gradient) ─────
+                    # These are the numbers we compare against PatchTST / SOTA.
+                    with torch.no_grad():
+                        mse_metric = mse_loss.detach()
+                        mae_metric = F.l1_loss(pred.detach(), y)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                opt.step()
+                scheduler.step()
+                model.invalidate_A_cache()
+
+                if ema_loss is None: ema_loss = loss.item()
+                ema_loss = 0.95 * ema_loss + 0.05 * loss.item()
+
+                if ema_mse is None: ema_mse = mse_metric.item()
+                ema_mse = 0.95 * ema_mse + 0.05 * mse_metric.item()
+
+                if step % PRINT_EVERY == 0:
+                    dts = " ".join(f"{op.dt.item():.3f}" for op in model.operators)
+                    print(f"Epoch {epoch:02d} Step {step:05d} | "
+                          f"Loss: {ema_loss:.4f} = "
+                          f"MSE {mse_loss.item():.4f} + "
+                          f"Diff {diff_loss.item():.4f} + "
+                          f"FFT {fft_loss.item():.4f} | "
+                          f"MAE: {mae_metric.item():.4f} | "
+                          f"dt: [{dts}]")
+                step += 1
+
+            # ── Epoch-end validation ────────────────────────────────────────
+            val_metrics = evaluate(model, val_loader, device)
+            print(f"\nEpoch {epoch:02d} VAL  MSE={val_metrics['MSE']:.4f}  MAE={val_metrics['MAE']:.4f}")
+
+            if val_metrics['MSE'] < best_val_mse:
+                best_val_mse = val_metrics['MSE']
+                best_path = f"{checkpoint_prefix}_best.pt"
+                torch.save(model.state_dict(), best_path)
+                print(f"  ✓ Best model saved: {best_path}")
+
+            if (epoch + 1) % CHECKPOINT_EVERY == 0:
+                ckpt_path = f"{checkpoint_prefix}_epoch{epoch:03d}.pt"
+                torch.save(model.state_dict(), ckpt_path)
+                print(f"  Checkpoint: {ckpt_path}")
+
+    except KeyboardInterrupt:
+        print(f"\nInterrupted at epoch {epoch} step {step}")
+
+    # ── Final test evaluation ───────────────────────────────────────────────
+    print("\n── Test set evaluation ──")
+    best_path = f"{checkpoint_prefix}_best.pt"
+    if os.path.exists(best_path):
+        model.load_state_dict(torch.load(best_path, map_location=device))
+    test_metrics = evaluate(model, test_loader, device)
+    print(f"TEST  MSE={test_metrics['MSE']:.4f}  MAE={test_metrics['MAE']:.4f}")
+    print(f"\nParams: {params:,}  ({params/1e6:.3f}M)")
+    print(f"Dataset: {dataset_name}  context={context_len}  pred={pred_len}")
+    return test_metrics
+
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset",  default=DATASET,      choices=list(ETT_URLS))
+    p.add_argument("--context",  type=int, default=CONTEXT_LEN)
+    p.add_argument("--pred_len", type=int, default=PRED_LEN,
+                   choices=[96, 192, 336, 720])
+    args = p.parse_args()
+    train(args.dataset, args.context, args.pred_len)
+
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
