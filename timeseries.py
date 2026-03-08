@@ -20,19 +20,21 @@ Standard prediction lengths: 96 / 192 / 336 / 720
 # ---------------------------------------------------------------------------
 # Hyper-parameters
 # ---------------------------------------------------------------------------
-DIM          = 16       # Wave-field width
-DEPTH        = 12        # Julia-set iterations
+DIM          = 64        # Wave-field width  (32=72K fast, 64=280K sweet spot, 128=1M slow)
+DEPTH        = 6        # depth > 4: adds new timescales cheaply vs wider DIM
 MIMO_P       = 4        # Hadamard block size
 
 N_CHANNELS   = 7        # ETT has 7 variates; override for other datasets
-CONTEXT_LEN  = 512      # Look-back window
+CONTEXT_LEN  = 512      # ODE burn-in: slow γ modes need ~512 steps to accumulate phase
 PRED_LEN     = 96       # Forecast horizon (96 / 192 / 336 / 720)
+PATCH_SIZE   = 16       # Patching: 512 hours → 32 patches. Variance drops to σ²/16, FFT 16× cheaper
 
-BASE_LR      = 1e-3
-WEIGHT_DECAY = 0.01
-BATCH_SIZE   = 4
+BASE_LR      = 1e-4     # SOTA standard: DLinear/PatchTST/iTransformer all use 1e-4
+WEIGHT_DECAY = 0.01     # L2 friction — prevents overfitting to training noise
+BATCH_SIZE   = 8       # benchmark standard
 GRAD_CLIP    = 1.0
-MAX_EPOCHS   = 100
+MAX_EPOCHS   = 15       # softer LR decay needs more epochs for basins to crystallise
+PATIENCE     = 5        # more runway before early stopping fires
 
 CHECKPOINT_EVERY = 1        # save every N epochs
 PRINT_EVERY      = 50       # steps
@@ -129,9 +131,12 @@ class ETTDataset(Dataset):
         if split == "train":
             raw = data[:n_train]
         elif split == "val":
-            raw = data[n_train : n_train + n_val]
+            # Overlap by context_len so the first predicted target is
+            # exactly at n_train — no 21-day black hole between splits.
+            raw = data[n_train - context_len : n_train + n_val]
         else:
-            raw = data[n_train + n_val :]
+            # Same for test: first target is exactly at n_train + n_val.
+            raw = data[n_train + n_val - context_len :]
 
         # Apply global standardisation: data is now Mean≈0, Std≈1
         self.data        = (raw - self.mean_) / self.std_
@@ -157,24 +162,23 @@ class ETTDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 class RevIN(nn.Module):
+    """Per-channel instance norm — each variable keeps its own coordinate ground.
+    Mean/std computed over the time axis only: [B, L, C] → stats [B, 1, C].
+    Matches PatchTST / iTransformer protocol."""
     def __init__(self, n_channels: int, eps: float = 1e-5):
         super().__init__()
-        self.eps    = eps
-        self.weight = nn.Parameter(torch.ones(n_channels))
-        self.bias   = nn.Parameter(torch.zeros(n_channels))
-        self._mean  = None
-        self._std   = None
+        self.eps   = eps
+        self._mean = None
+        self._std  = None
 
     def norm(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, L, C] → normalised [B, L, C]"""
-        self._mean = x.mean(dim=1, keepdim=True)               # [B, 1, C]
-        self._std  = x.std(dim=1, keepdim=True) + self.eps    # [B, 1, C]
-        x = (x - self._mean) / self._std
-        return x * self.weight + self.bias
+        self._mean = x.mean(dim=1, keepdim=True).detach()       # [B, 1, C]
+        self._std  = (x.var(dim=1, keepdim=True) + self.eps).sqrt().detach()  # [B, 1, C]
+        return (x - self._mean) / self._std
 
     def denorm(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, P, C] → original scale [B, P, C]"""
-        x = (x - self.bias) / self.weight
         return x * self._std + self._mean
 
 
@@ -277,32 +281,46 @@ class FractalRationalMap(nn.Module):
 
 class FractalFFN(nn.Module):
     """
-    Fractal Feed-Forward — natively complex, replaces SwiGLU entirely.
+    Complex FFN with mode mixing + element-wise nonlinearity.
 
-    The residual stream z is complex throughout the network. Each layer's
-    fractal map is one iteration of the Julia set recurrence z_{ℓ+1} = R(z_ℓ).
-    Across 4 layers, the signal passes through 4 fractal iterations, carving
-    progressively finer basin boundaries into the complex phase space.
+    Pipeline:  z → CRMSNorm → ComplexLinear (mode mixing) → Dropout → RationalMap → residual
 
-    Pipeline:  z_complex → CRMSNorm (pure unit-sphere) → FractalRationalMap → residual
+    The linear layer lets wave modes interact (e.g. 24h cycle modulating
+    weekly pattern).  The rational map applies element-wise magnitude
+    squashing with learned rotation — a valid complex nonlinearity that
+    prevents the residual stream from exploding while preserving phase.
 
-    The norm projects onto the unit hyper-sphere: |z|=1 everywhere.
-    The fractal map is the SOLE arbiter of scale. No fighting parameters.
-
-    Total params: 6 × dim per layer (pure fractal only).
+    Params per layer: dim² × 2 (linear real+imag) + 6×dim (rational map).
+    At dim=32: 2,048 + 192 = 2,240 per layer.  Still tiny.
     """
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, dropout: float = 0.1):
         super().__init__()
         self.eps     = eps
+        # Complex linear: learned mode mixing.  Applied as separate
+        # real-valued matmuls on Re and Im parts, then recombined:
+        #   W·z = W·(a+bi) = W·a + i·W·b  (real weights, complex input)
+        # This lets mode k's output depend on ALL other modes' states.
+        self.mix = nn.Linear(dim, dim, bias=False)
+        # Shared-mask dropout: one Bernoulli mask applied to BOTH Re and Im.
+        # This zeros entire complex modes (not half-modes), keeping the
+        # physical meaning intact — a mode is either present or absent.
+        self.drop    = nn.Dropout(dropout)
         self.fractal = FractalRationalMap(dim)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """z: [..., D] complex → [..., D] complex"""
-        # Pure unit-sphere projection: |z_normed| = 1 everywhere
+        # CRMSNorm: project to unit sphere — stable input to mixing + nonlinearity
         rms = (z.real**2 + z.imag**2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         z_normed = z / rms
-        # Julia-set rational map — one iteration of the fractal recurrence
-        return z + self.fractal(z_normed)
+        # Mode mixing: cast outputs to fp32 — torch.complex doesn't support bfloat16
+        r_mixed = self.mix(z_normed.real).float()
+        i_mixed = self.mix(z_normed.imag).float()
+        # Shared dropout mask: sample once on real part, apply to both.
+        # Zeroes out complete complex modes so Re²+Im² → 0 together.
+        mask = (self.drop(torch.ones_like(r_mixed)) > 0).float()  # {0,1} Bernoulli
+        z_mixed = torch.complex(r_mixed * mask, i_mixed * mask)
+        # Element-wise nonlinearity: magnitude squashing + rotation
+        return z + self.fractal(z_mixed)
 
 
 # ---------------------------------------------------------------------------
@@ -349,9 +367,11 @@ class SchrodingerAttention(nn.Module):
     """
 
     def __init__(self, dim: int, n_bands: int = 4, mimo_p: int = 8,
-                 layer_idx: int = 0, depth: int = 1, state_dim: int = None):
+                 layer_idx: int = 0, depth: int = 1, state_dim: int = None,
+                 patch_size: int = 1):
         super().__init__()
         self.dim    = dim
+        self.patch_size = patch_size
         # state_dim: wave field width. Default = dim (no change). Set larger on deep/slow
         # layers to increase long-term memory capacity without widening the FFN or embedding.
         SD = self.state_dim = state_dim if state_dim is not None else dim
@@ -374,9 +394,11 @@ class SchrodingerAttention(nn.Module):
         # softplus is 10× larger, bringing L3 into the same learnable regime as L1/L2.
         # Phasors also rotate 10× faster → more distinct phases per key → better SNR.
         # Inverse softplus so F.softplus(self.dt) == target_dt exactly at init.
+        # PATCHING: Scale dt by patch_size so physical wavelengths are preserved.
+        # If one step = 16 hours, the continuous clock must tick 16× faster per step.
         dt_max, dt_min = 0.1, 0.01
         ratio          = layer_idx / max(depth - 1, 1)
-        target_dt      = dt_max * (dt_min / dt_max) ** ratio   # geometric interp
+        target_dt      = dt_max * (dt_min / dt_max) ** ratio * patch_size  # scale by patch
         inv_sp_dt      = math.log(math.expm1(target_dt))       # softplus⁻¹
         self.dt        = nn.Parameter(torch.tensor(inv_sp_dt, dtype=torch.float32))
 
@@ -784,57 +806,57 @@ class WaveForecaster(nn.Module):
     """
     Schrödinger Wave SSM for multivariate time-series forecasting.
 
-    Channel Independent architecture (CI): each of the C variates is treated
-    as a separate univariate series and passed through the SAME wave physics.
-    The fractal basins learn the universal dynamics of the system, not
-    cross-channel correlations that break under distribution shift.
+    Channel Independent (CI): each variate is a separate univariate series
+    through the SAME wave physics.  Per-channel RevIN gives each variable
+    its own coordinate ground — the ODE solves in a consistent frame.
 
     Architecture:
       revin       : RevIN(n_channels) — per-channel instance normalisation
-      input_proj  : Linear(1, dim)    — lift scalar → wave field  (shared)
-      operators   : SchrodingerAttention × depth  (complex SSM + fractal + Hadamard)
-      ffn         : FractalFFN × depth
-      pred_proj   : Linear(dim, pred_len) — project last hidden → horizon  (shared)
+      input_proj  : Linear(1, dim)    — lift scalar → wave field
+      operators   : SchrodingerAttention × depth  (wave cascade, no FFN between)
+      pred_proj   : Linear(4*dim, pred_len) — DMS from bidirectional frontier
 
     forward(x: [B, L, C]) → pred: [B, pred_len, C]
-
-    Internally: [B, L, C] → [B*C, L, 1] → SSM → [B*C, pred_len] → [B, P, C]
+    Internally: [B, L, C] → [B*C, L, 1] → SSM → [B*C, P] → [B, P, C]
     """
 
     def __init__(self, n_channels: int = N_CHANNELS, dim: int = DIM,
                  depth: int = DEPTH, pred_len: int = PRED_LEN,
+                 patch_size: int = PATCH_SIZE,
                  use_checkpoint: bool = False, state_dims: list = None):
         super().__init__()
         self.dim            = dim
         self.depth          = depth
         self.pred_len       = pred_len
         self.n_channels     = n_channels
+        self.patch_size     = patch_size
         self.use_checkpoint = use_checkpoint
 
         self.state_dims = state_dims if state_dims is not None else [dim] * depth
         assert len(self.state_dims) == depth
 
-        # ── Channel-Independent projections ───────────────────────────
-        # Each channel is a univariate scalar lifted into the wave field.
-        # Shared weights across all channels: the physics is universal.
-        self.input_proj = nn.Linear(1, dim)        # scalar → wave field
+        # ── Patching: downsample time coordinate ───────────────────────
+        # 512 hours → 32 patches of 16 hours each.
+        # Variance drops to σ²/16, FFT cost drops 16×, dt hierarchy sees cleaner signal.
+        # Linear(patch_size, dim) learns the optimal patch embedding.
+        self.input_proj = nn.Linear(patch_size, dim)  # [16 hours] → wave field
 
-        # ── RevIN: per-channel instance norm (reversed at output) ─────
+        # ── RevIN: per-channel instance norm ──────────────────────
         self.revin = RevIN(n_channels)
 
-        # ── Wave physics (unchanged from language model) ──────────────
+        # ── Wave physics: pure SSM cascade ─────────────────────────────
+        # No FFN between layers — SSM output feeds directly into the next.
+        # Each SchrodingerAttention already contains a FractalRationalMap.
         self.operators = nn.ModuleList([
             SchrodingerAttention(dim, mimo_p=MIMO_P, layer_idx=i, depth=depth,
-                                 state_dim=self.state_dims[i])
+                                 state_dim=self.state_dims[i], patch_size=patch_size)
             for i in range(depth)
         ])
-        self.ffn = nn.ModuleList([
-            FractalFFN(dim) for _ in range(depth)
-        ])
 
-        # ── Forecast head (channel-independent) ──────────────────────
-        # Last hidden state [dim] → pred_len scalars.  Shared across channels.
-        self.pred_proj = nn.Linear(dim, pred_len)
+        # ── Direct Multi-Step forecast head ───────────────────────────
+        # fwd_real + fwd_imag + bwd_real + bwd_imag = 4D features.
+        # One linear draws the entire horizon — no error accumulation.
+        self.pred_proj = nn.Linear(4 * dim, pred_len)
 
     def make_state(self, batch: int = 1, device=None,
                    dtype: torch.dtype = torch.complex64) -> list:
@@ -844,8 +866,8 @@ class WaveForecaster(nn.Module):
                 for sd in self.state_dims]
 
     def _encode(self, x: torch.Tensor):
-        """Shared encode path. x: [B*C, L, 1] real → z: [B*C, L, D] complex"""
-        z_real = self.input_proj(x)                                    # [B*C, L, D]
+        """x: [B*C, L//P, P] real → z: [B*C, L//P, D] complex (P=patch_size)"""
+        z_real = self.input_proj(x)                                    # [B*C, L//P, D]
         z = torch.complex(z_real.float(),
                           torch.zeros_like(z_real, dtype=torch.float32))
         z_prev = torch.zeros_like(z_real)
@@ -857,34 +879,39 @@ class WaveForecaster(nn.Module):
             else:
                 wave_out = self.operators[i](z_in_real, z_prev)
             z      = z + wave_out
-            z      = self.ffn[i](z)
             z_prev = z.real
         return z
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x    : [B, context_len, C]  raw time-series (globally standardised)
-        → pred: [B, pred_len,    C]  forecast (same scale as input)
+        x    : [B, context_len, C]
+        → pred: [B, pred_len,    C]
 
-        Channel Independent: each variate processed as a separate univariate
-        series through the same wave physics.  RevIN handles per-instance shift.
+        CI: each channel is an independent univariate series.
+        Per-channel RevIN keeps each variable in its own coordinate frame.
         """
         B, L, C = x.shape
-        x    = self.revin.norm(x)                                      # [B, L, C]
+        P = self.patch_size
+        assert L % P == 0, f"context_len={L} must be divisible by patch_size={P}"
+        x = self.revin.norm(x)                                         # [B, L, C]
 
-        # ── Channel Independence: [B, L, C] → [B*C, L, 1] ───────────
-        x_ci = x.permute(0, 2, 1).reshape(B * C, L, 1)               # [B*C, L, 1]
+        # [B, L, C] → [B*C, L] → [B*C, L//P, P]  (patching)
+        x_ci = x.permute(0, 2, 1).reshape(B * C, L)                    # [B*C, L]
+        x_ci = x_ci.view(B * C, L // P, P)                             # [B*C, 32, 16]
 
-        z    = self._encode(x_ci)                                      # [B*C, L, D] complex
-        # Mean-pool over ALL positions — every timestep gets a direct
-        # gradient path. The last state alone is a 64→96+ bottleneck;
-        # pooling lets the head read dynamics from the full context.
-        pooled = z.real.mean(dim=1)                                    # [B*C, D]
-        pred   = self.pred_proj(pooled)                                # [B*C, P]
+        z_fwd = self._encode(x_ci)                                     # [B*C, L//P, D]
+        z_bwd = self._encode(x_ci.flip(dims=[1]))                      # [B*C, L//P, D]
 
-        # ── Reassemble channels: [B*C, P] → [B, P, C] ────────────────
+        z_fwd_last = z_fwd[:, -1, :]                                   # [B*C, D]
+        z_bwd_last = z_bwd[:, -1, :]                                   # [B*C, D]
+        features = torch.cat([
+            z_fwd_last.real, z_fwd_last.imag,
+            z_bwd_last.real, z_bwd_last.imag,
+        ], dim=-1).float()                                             # [B*C, 4D]
+
+        pred = self.pred_proj(features)                                # [B*C, P]
         pred = pred.reshape(B, C, self.pred_len).permute(0, 2, 1)    # [B, P, C]
-        pred = self.revin.denorm(pred)                                 # back to per-instance scale
+        pred = self.revin.denorm(pred)
         return pred
 
     def invalidate_A_cache(self) -> None:
@@ -958,7 +985,7 @@ def train(dataset_name: str = DATASET,
 
     n_channels = train_ds.data.shape[1]
     model  = WaveForecaster(n_channels=n_channels, dim=DIM, depth=DEPTH,
-                            pred_len=pred_len).to(device)
+                            pred_len=pred_len, use_checkpoint=True).to(device)
     params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {params:,}  ({params/1e6:.3f}M)")
 
@@ -986,22 +1013,24 @@ def train(dataset_name: str = DATASET,
                    if id(p) not in dt_id_set and p.requires_grad]
     opt = optim.AdamW([
         {'params': base_params, 'lr': BASE_LR,      'weight_decay': WEIGHT_DECAY},
-        {'params': dt_params,   'lr': BASE_LR * 30, 'weight_decay': 0.0},
+        {'params': dt_params,   'lr': BASE_LR * 10, 'weight_decay': 0.0},
     ], eps=1e-8)
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=[BASE_LR, BASE_LR * 30],
-        epochs=MAX_EPOCHS, steps_per_epoch=len(train_loader),
-        pct_start=0.1, anneal_strategy='cos',
+    # Softer decay: 0.7× per epoch.  The 0.5× schedule was designed for
+    # near-linear models (DLinear/PatchTST) that converge in 3-4 epochs.
+    # Our deeply nonlinear SSM (fractal maps, Born rule, complex phase)
+    # needs more gradient time to crystallize its basin boundaries.
+    scheduler = optim.lr_scheduler.LambdaLR(
+        opt, lr_lambda=lambda epoch: 0.7 ** epoch
     )
 
     best_val_mse = float('inf')
+    patience_counter = 0
     step = 0
 
     try:
         for epoch in range(start_epoch, MAX_EPOCHS):
             model.train()
-            ema_loss = None   # EMA of physics training loss
-            ema_mse  = None   # EMA of pure MSE (evaluation metric, no gradients)
+            ema_loss = None   # EMA of training MSE
             for x, y in train_loader:
                 x, y = x.to(device), y.to(device)
 
@@ -1009,65 +1038,52 @@ def train(dataset_name: str = DATASET,
                                     enabled=USE_AMP and device.type == 'cuda'):
                     pred = model(x)                             # [B, P, C]
 
-                    # ── Training objective (full gradient path) ─────────────
-                    # MSE: absolute coordinate anchor (fixes the integration constant).
-                    mse_loss  = F.mse_loss(pred, y)
+                    # ── Training objective: pure MSE ────────────────────────
+                    # Every SOTA model (DLinear, PatchTST, iTransformer) uses
+                    # MSE only.  Auxiliary losses (Sobolev, spectral) add
+                    # competing gradient signals that hurt a tiny 18K-param model.
+                    loss = F.mse_loss(pred, y)
 
-                    # Sobolev: first-difference penalty — forces correct velocity/shape.
-                    # A flat prediction has Δ=0; if the target oscillates this is brutal.
-                    diff_loss = F.mse_loss(pred[:, 1:] - pred[:, :-1],
-                                           y[:, 1:]    - y[:, :-1])
-
-                    # Spectral: amplitude-spectrum penalty — enforces 24 h / 168 h harmonics.
-                    # Phase-shift-tolerant: rewards correct frequencies, not exact timing.
-                    # norm='ortho' applies 1/√N so FFT amplitudes are on the SAME scale
-                    # as temporal values (Parseval-exact). Without this, |X[k]|≈√(N/2)·σ
-                    # and the 0.01 weight is actually ~0.5 effective — stealing gradient.
-                    pred_fft = torch.fft.rfft(pred.float(), dim=1, norm='ortho').abs()
-                    y_fft    = torch.fft.rfft(y.float(),   dim=1, norm='ortho').abs()
-                    fft_loss = F.mse_loss(pred_fft, y_fft)
-
-                    loss = mse_loss + 0.1 * diff_loss + 0.01 * fft_loss
-
-                    # ── Evaluation metrics (observer only, no gradient) ─────
-                    # These are the numbers we compare against PatchTST / SOTA.
                     with torch.no_grad():
-                        mse_metric = mse_loss.detach()
                         mae_metric = F.l1_loss(pred.detach(), y)
 
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 opt.step()
-                scheduler.step()
                 model.invalidate_A_cache()
 
                 if ema_loss is None: ema_loss = loss.item()
                 ema_loss = 0.95 * ema_loss + 0.05 * loss.item()
 
-                if ema_mse is None: ema_mse = mse_metric.item()
-                ema_mse = 0.95 * ema_mse + 0.05 * mse_metric.item()
-
                 if step % PRINT_EVERY == 0:
+                    val_metrics = evaluate(model, val_loader, device)
                     dts = " ".join(f"{op.dt.item():.3f}" for op in model.operators)
+                    lr_now = opt.param_groups[0]['lr']
                     print(f"Epoch {epoch:02d} Step {step:05d} | "
-                          f"Loss: {ema_loss:.4f} = "
-                          f"MSE {mse_loss.item():.4f} + "
-                          f"Diff {diff_loss.item():.4f} + "
-                          f"FFT {fft_loss.item():.4f} | "
+                          f"train: {ema_loss:.4f} | "
+                          f"val: {val_metrics['MSE']:.4f} | "
                           f"MAE: {mae_metric.item():.4f} | "
+                          f"lr: {lr_now:.2e} | "
                           f"dt: [{dts}]")
                 step += 1
 
             # ── Epoch-end validation ────────────────────────────────────────
+            scheduler.step()
             val_metrics = evaluate(model, val_loader, device)
-            print(f"\nEpoch {epoch:02d} VAL  MSE={val_metrics['MSE']:.4f}  MAE={val_metrics['MAE']:.4f}")
 
             if val_metrics['MSE'] < best_val_mse:
                 best_val_mse = val_metrics['MSE']
+                patience_counter = 0
                 best_path = f"{checkpoint_prefix}_best.pt"
                 torch.save(model.state_dict(), best_path)
                 print(f"  ✓ Best model saved: {best_path}")
+            else:
+                patience_counter += 1
+                print(f"  No improvement ({patience_counter}/{PATIENCE})")
+                if patience_counter >= PATIENCE:
+                    print(f"  Early stopping at epoch {epoch}")
+                    break
 
             if (epoch + 1) % CHECKPOINT_EVERY == 0:
                 ckpt_path = f"{checkpoint_prefix}_epoch{epoch:03d}.pt"
@@ -1099,139 +1115,3 @@ if __name__ == "__main__":
                    choices=[96, 192, 336, 720])
     args = p.parse_args()
     train(args.dataset, args.context, args.pred_len)
-
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-
-    data_path  = prepare_tinystories_dataset()
-    # Dataset always loads MAX_SEQ_LENGTH; variable_collate_fn truncates each
-    # batch to a length sampled from SEQ_SCHEDULE before it hits the model.
-    dataset    = TinyStoriesDataset(data_path, seq_length=MAX_SEQ_LENGTH, stride=256)
-
-    _lengths = [l for l, _ in SEQ_SCHEDULE]
-    _probs   = np.array([p for _, p in SEQ_SCHEDULE], dtype=np.float64)
-    _probs  /= _probs.sum()   # normalise in case they don't sum to 1
-
-    def variable_collate_fn(batch):
-        """Sample one seq_len from SEQ_SCHEDULE and truncate the whole batch."""
-        L   = int(np.random.choice(_lengths, p=_probs))
-        xs  = torch.stack([item[0][:L] for item in batch])
-        ys  = torch.stack([item[1][:L] for item in batch])
-        return xs, ys
-
-    dataloader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=True,
-        persistent_workers=(NUM_WORKERS > 0),
-        collate_fn=variable_collate_fn,
-    )
-
-    model  = ContinuousTransformer(dim=DIM, depth=DEPTH, vocab=VOCAB_SIZE).to(device)
-    params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {params/1e6:.2f}M")
-
-    # Checkpoint restore
-    checkpoints = glob.glob(f"{checkpoint_prefix}_step*.pt")
-    if checkpoints:
-        steps = [int(cp.split("step")[1].split(".")[0]) for cp in checkpoints]
-        latest    = max(steps)
-        ckpt_path = f"{checkpoint_prefix}_step{latest:05d}.pt"
-        print(f"Loading checkpoint: {ckpt_path}")
-        try:
-            missing, unexpected = model.load_state_dict(
-                torch.load(ckpt_path, map_location=device), strict=False
-            )
-            if missing:
-                print(f"  New params (random init): {missing}")
-            if unexpected:
-                print(f"  Dropped params: {unexpected}")
-            start_step = latest
-            print(f"Resuming from step {start_step}")
-        except Exception as e:
-            print(f"Load failed ({e}). Starting fresh.")
-            start_step = 0
-    else:
-        start_step = 0
-        print("No checkpoint found. Starting fresh.")
-
-    # torch.compile disabled locally: torchinductor has no complex op codegen,
-    # so it adds graph-materialization memory overhead with zero fusion benefit.
-    # Re-enable on Colab A100 where complex CUDA kernels are available:
-    #   model = torch.compile(model)
-
-    # dt params need 30x higher LR: softplus'(softplus_inv(0.001)) ≈ 0.001, so the
-    # gradient reaching dt_raw is 1000x smaller than a normal param. weight_decay=0
-    # because L2 on a log-timescale param biases it toward 0 (faster decay = forgetting).
-    dt_params   = [op.dt       for op in model.operators] + \
-                  [op.dt_scout for op in model.operators]
-    dt_id_set   = {id(p) for p in dt_params}
-    base_params = [p for p in model.parameters()
-                   if id(p) not in dt_id_set and p.requires_grad]
-    opt = optim.AdamW([
-        {'params': base_params, 'initial_lr': BASE_LR,       'lr': BASE_LR,       'weight_decay': WEIGHT_DECAY},
-        {'params': dt_params,   'initial_lr': BASE_LR * 30,  'lr': BASE_LR * 30,  'weight_decay': 0.0},
-    ], eps=1e-8, fused=True)
-    ema_loss = None
-    step     = start_step
-
-    try:
-        while True:
-            for x, y in dataloader:
-                x, y = x.to(device), y.to(device)
-
-                # bfloat16 matmuls (linear layers) + float32 wave physics / loss
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                                    enabled=USE_AMP and device.type == 'cuda'):
-                    logits, _ = model(x)
-                    loss = nn.CrossEntropyLoss()(logits.view(-1, VOCAB_SIZE), y.view(-1))
-
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-
-                # clip_grad_norm_ returns pre-clip total norm — reuse for reactive LR
-                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-
-                with torch.no_grad():
-                    if ema_loss is None:
-                        ema_loss = loss.item()
-                    ema_loss      = 0.95 * ema_loss + 0.05 * loss.item()
-                    stability     = 1.0 / (grad_norm.item() + 1e-6)
-                    lr_multiplier = 1.0 / (1.0 + np.exp(-(stability - 0.5)))
-                    for pg in opt.param_groups:
-                        # Scale each group's own initial_lr — preserves the 30x dt ratio
-                        pg["lr"] = pg["initial_lr"] * lr_multiplier
-
-                opt.step()
-                # A = exp((-γ+iω)·dt) is cached; must recompute after dt changes.
-                # Without this, generate() and any forward_step call in the same
-                # process would use stale physics from before the last optimizer step.
-                model.invalidate_A_cache()
-
-                if step % PRINT_EVERY == 0:
-                    acc = (logits.argmax(-1) == y).float().mean()
-                    dts = " ".join(f"{op.dt.item():.3f}" for op in model.operators)
-                    current_lr = opt.param_groups[0]["lr"]
-                    print(
-                        f"Step {step:05d} | L={x.shape[1]:4d} | Loss: {loss.item():.4f} | "
-                        f"Acc: {acc.item()*100:.1f}% | LR: {current_lr:.2e} | "
-                        f"dt: [{dts}]"
-                    )
-
-                if step % CHECKPOINT_EVERY == 0 and step > start_step:
-                    generate(model, "The capital of France is ", device=str(device))
-                    ckpt_path = f"{checkpoint_prefix}_step{step:05d}.pt"
-                    torch.save(model.state_dict(), ckpt_path)
-                    print(f"Checkpoint saved: {ckpt_path}")
-
-                step += 1
-
-    except KeyboardInterrupt:
-        print(f"\nInterrupted at step {step}")
-        final = f"{checkpoint_prefix}_step{step:05d}.pt"
-        torch.save(model.state_dict(), final)
-        print(f"Saved: {final}")
-
-
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    train()

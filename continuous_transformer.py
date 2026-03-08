@@ -24,7 +24,7 @@ MIMO_P         = 4        # Smaller channel-mixing blocks (128 / 4 = 32 groups)
 
 BASE_LR        = 5e-4     # Higher LR — tiny models need more of a kick
 WEIGHT_DECAY   = 0.01
-BATCH_SIZE     = 16        # DIM=128 is 4x smaller; batch=2 gives 4x less VRAM than before
+BATCH_SIZE     = 8        # DIM=128 is 4x smaller; batch=2 gives 4x less VRAM than before
 # Variable sequence length curriculum.
 # Each entry is (seq_len, sampling_probability).
 # Most steps are short (fast + diverse data); rare long steps train memory.
