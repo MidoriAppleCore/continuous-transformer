@@ -20,7 +20,7 @@ Standard prediction lengths: 96 / 192 / 336 / 720
 # ---------------------------------------------------------------------------
 # Hyper-parameters
 # ---------------------------------------------------------------------------
-DIM          = 64        # Wave-field width  (32=72K fast, 64=280K sweet spot, 128=1M slow)
+DIM          = 16        # Wave-field width  (32=72K fast, 64=280K sweet spot, 128=1M slow)
 DEPTH        = 6        # depth > 4: adds new timescales cheaply vs wider DIM
 MIMO_P       = 4        # Hadamard block size
 
@@ -31,23 +31,35 @@ PATCH_SIZE   = 16       # Patching: 512 hours → 32 patches. Variance drops to 
 
 BASE_LR      = 1e-4     # SOTA standard: DLinear/PatchTST/iTransformer all use 1e-4
 WEIGHT_DECAY = 0.01     # L2 friction — prevents overfitting to training noise
-BATCH_SIZE   = 8       # benchmark standard
+BATCH_SIZE   = 256       # benchmark standard
 GRAD_CLIP    = 1.0
-MAX_EPOCHS   = 15       # softer LR decay needs more epochs for basins to crystallise
-PATIENCE     = 5        # more runway before early stopping fires
-
-CHECKPOINT_EVERY = 1        # save every N epochs
+MAX_STEPS        = 20_000   # hard ceiling; early stopping usually fires well before
+VAL_EVERY        = 500      # full 4×4 validation table every N steps
+PATIENCE_STEPS   = 3_000    # stop if no improvement for this many steps
+CHECKPOINT_EVERY = 2_000    # save checkpoint every N steps
 PRINT_EVERY      = 50       # steps
 
 USE_AMP    = True
 NUM_WORKERS = 2
 
 DATASET    = "ETTh1"    # ETTh1 | ETTh2 | ETTm1 | ETTm2
+MAX_PRED   = 720        # Head always outputs max horizon; eval slices first N
+PRED_LENS  = [96, 192, 336, 720]
+
+# Physical time per step (relative to 1 hour).
+# ETTh: 1 hour/step.  ETTm: 15 min/step = 0.25 hours/step.
+# The SSM kernel scales dt by this factor so the continuous ODE
+# ticks at the correct physical rate regardless of sampling frequency.
+TIME_SCALES = {
+    "ETTh1": 1.0, "ETTh2": 1.0,
+    "ETTm1": 0.25, "ETTm2": 0.25,
+}
 
 # ---------------------------------------------------------------------------
 # Imports
 # ---------------------------------------------------------------------------
-import math, os, glob, urllib.request
+import math, os, glob, random, urllib.request
+from itertools import cycle
 import numpy as np
 import pandas as pd
 import torch
@@ -113,6 +125,14 @@ class ETTDataset(Dataset):
         path = prepare_ett_dataset(name, root)
         df   = pd.read_csv(path, index_col=0, parse_dates=True)
         data = df.values.astype(np.float32)          # [T, C]
+
+        # ── Resample ETTm (15-min) → hourly by averaging every 4 rows ──
+        # After this, all datasets are on the same 1-hour clock.
+        # The model sees pure sequences — no time_scale stretching needed.
+        if name.startswith("ETTm"):
+            T_orig = len(data)
+            T_trim = (T_orig // 4) * 4               # drop trailing partial hour
+            data   = data[:T_trim].reshape(-1, 4, data.shape[1]).mean(axis=1)
 
         T = len(data)
         train_frac, val_frac, _ = ETT_SPLITS[name]
@@ -552,7 +572,8 @@ class SchrodingerAttention(nn.Module):
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor,
-               z_prev: torch.Tensor | None = None) -> torch.Tensor:
+               z_prev: torch.Tensor | None = None,
+               time_scale: float = 1.0) -> torch.Tensor:
         """
         Exact parallel training pass via causal FFT convolution.
 
@@ -560,9 +581,10 @@ class SchrodingerAttention(nn.Module):
         is a causal convolution with kernel k(t) = A^t.
         The FFT computes this exactly in O(L log L).
 
-        x      : [B, L, D]  real
-        z_prev : [B, L, D]  previous layer's output (predictive coding signal)
-        returns: [B, L, D]  real
+        x          : [B, L, D]  real
+        z_prev     : [B, L, D]  previous layer's output (predictive coding signal)
+        time_scale : float      physical time per step (1.0=hourly, 0.25=15min)
+        returns    : [B, L, D]  real
         """
         B, L, D  = x.shape
         SD       = self.state_dim    # true wave field width
@@ -581,7 +603,7 @@ class SchrodingerAttention(nn.Module):
             surprise = (x - z_prev).abs().mean(-1, keepdim=True)        # [B, L, 1]
             gate = gate * (1.0 + torch.tanh(self.surprise_gain) * surprise)
         # ── True Wave kernel (SD dims, Simpson's folded in) ──────────────────
-        dt        = F.softplus(self.dt)
+        dt        = F.softplus(self.dt) * time_scale
         gamma_eff = F.softplus(self.log_gamma) * (~self.unitary_mask).float()
         lam       = torch.complex(-gamma_eff, self.omega)
         t_axis    = torch.arange(L, device=x.device, dtype=torch.float32)
@@ -592,7 +614,7 @@ class SchrodingerAttention(nn.Module):
 
         # ── Scout Wave kernel (ScoutDim ≤ SD, independent physics) ───────────
         # Bottlenecked: deep layers run scout at dim=256 instead of SD=1024 — 4× cheaper.
-        dt_s         = F.softplus(self.dt_scout)
+        dt_s         = F.softplus(self.dt_scout) * time_scale
         gamma_eff_s  = F.softplus(self.log_gamma_scout) * (~self.unitary_mask_scout).float()
         lam_s        = torch.complex(-gamma_eff_s, self.omega_scout)
         kernel_scout = torch.exp(lam_s.unsqueeze(0) * t_axis.unsqueeze(1) * dt_s)  # [L, ScoutDim]
@@ -821,13 +843,13 @@ class WaveForecaster(nn.Module):
     """
 
     def __init__(self, n_channels: int = N_CHANNELS, dim: int = DIM,
-                 depth: int = DEPTH, pred_len: int = PRED_LEN,
+                 depth: int = DEPTH,
                  patch_size: int = PATCH_SIZE,
+                 dataset_names: list[str] | None = None,
                  use_checkpoint: bool = False, state_dims: list = None):
         super().__init__()
         self.dim            = dim
         self.depth          = depth
-        self.pred_len       = pred_len
         self.n_channels     = n_channels
         self.patch_size     = patch_size
         self.use_checkpoint = use_checkpoint
@@ -853,10 +875,21 @@ class WaveForecaster(nn.Module):
             for i in range(depth)
         ])
 
-        # ── Direct Multi-Step forecast head ───────────────────────────
-        # fwd_real + fwd_imag + bwd_real + bwd_imag = 4D features.
-        # One linear draws the entire horizon — no error accumulation.
-        self.pred_proj = nn.Linear(4 * dim, pred_len)
+        # ── Per-dataset SSM adapters + shared prediction head ─────────
+        # Each dataset gets its own SchrodingerAttention adapter layer
+        # that refines the shared encoder's features with dataset-specific
+        # wave physics (ω, γ, dt). This is ~4K params per dataset.
+        # The Linear readout is shared — it just decodes the adapted
+        # wave features into prediction positions.
+        self.max_pred_len = MAX_PRED
+        _ds_names = dataset_names if dataset_names is not None else ["ETTh1", "ETTh2"]
+        self.adapters = nn.ModuleDict({
+            name: SchrodingerAttention(dim, mimo_p=MIMO_P,
+                                       layer_idx=depth, depth=depth + 1,
+                                       state_dim=dim, patch_size=patch_size)
+            for name in _ds_names
+        })
+        self.pred_proj = nn.Linear(4 * dim, MAX_PRED)  # shared readout
 
     def make_state(self, batch: int = 1, device=None,
                    dtype: torch.dtype = torch.complex64) -> list:
@@ -865,7 +898,7 @@ class WaveForecaster(nn.Module):
         return [torch.zeros(batch, 4, sd, dtype=dtype, device=device)
                 for sd in self.state_dims]
 
-    def _encode(self, x: torch.Tensor):
+    def _encode(self, x: torch.Tensor, time_scale: float = 1.0):
         """x: [B*C, L//P, P] real → z: [B*C, L//P, D] complex (P=patch_size)"""
         z_real = self.input_proj(x)                                    # [B*C, L//P, D]
         z = torch.complex(z_real.float(),
@@ -875,23 +908,26 @@ class WaveForecaster(nn.Module):
             z_in_real = z.real
             if self.training and self.use_checkpoint:
                 wave_out = checkpoint(self.operators[i], z_in_real, z_prev,
-                                      use_reentrant=False)
+                                      time_scale, use_reentrant=False)
             else:
-                wave_out = self.operators[i](z_in_real, z_prev)
+                wave_out = self.operators[i](z_in_real, z_prev, time_scale=time_scale)
             z      = z + wave_out
             z_prev = z.real
         return z
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time_scale: float = 1.0,
+                pred_len: int | None = None,
+                dataset_name: str = "ETTh1") -> torch.Tensor:
         """
-        x    : [B, context_len, C]
-        → pred: [B, pred_len,    C]
-
-        CI: each channel is an independent univariate series.
-        Per-channel RevIN keeps each variable in its own coordinate frame.
+        x            : [B, context_len, C]
+        time_scale   : physical time per step (1.0=hourly, 0.25=15min)
+        pred_len     : output horizon (default: max_pred_len=720)
+        dataset_name : selects the per-dataset adapter head
+        → pred       : [B, pred_len, C]
         """
         B, L, C = x.shape
         P = self.patch_size
+        pl = pred_len if pred_len is not None else self.max_pred_len
         assert L % P == 0, f"context_len={L} must be divisible by patch_size={P}"
         x = self.revin.norm(x)                                         # [B, L, C]
 
@@ -899,8 +935,13 @@ class WaveForecaster(nn.Module):
         x_ci = x.permute(0, 2, 1).reshape(B * C, L)                    # [B*C, L]
         x_ci = x_ci.view(B * C, L // P, P)                             # [B*C, 32, 16]
 
-        z_fwd = self._encode(x_ci)                                     # [B*C, L//P, D]
-        z_bwd = self._encode(x_ci.flip(dims=[1]))                      # [B*C, L//P, D]
+        z_fwd = self._encode(x_ci, time_scale)                         # [B*C, L//P, D]
+        z_bwd = self._encode(x_ci.flip(dims=[1]), time_scale)          # [B*C, L//P, D]
+
+        # Per-dataset SSM adapter: refine full sequence with dataset-specific physics
+        adapter = self.adapters[dataset_name]
+        z_fwd = z_fwd + adapter(z_fwd.real)                            # residual
+        z_bwd = z_bwd + adapter(z_bwd.real)
 
         z_fwd_last = z_fwd[:, -1, :]                                   # [B*C, D]
         z_bwd_last = z_bwd[:, -1, :]                                   # [B*C, D]
@@ -909,13 +950,17 @@ class WaveForecaster(nn.Module):
             z_bwd_last.real, z_bwd_last.imag,
         ], dim=-1).float()                                             # [B*C, 4D]
 
-        pred = self.pred_proj(features)                                # [B*C, P]
-        pred = pred.reshape(B, C, self.pred_len).permute(0, 2, 1)    # [B, P, C]
+        full = self.pred_proj(features)                                # [B*C, MAX_PRED]
+        pred = full[:, :pl]                                            # [B*C, pl]
+        pred = pred.reshape(B, C, pl).permute(0, 2, 1)                # [B, pl, C]
         pred = self.revin.denorm(pred)
         return pred
 
     def invalidate_A_cache(self) -> None:
         for op in self.operators:
+            op._A_cache       = None
+            op._A_scout_cache = None
+        for op in self.adapters.values():
             op._A_cache       = None
             op._A_scout_cache = None
 
@@ -925,12 +970,17 @@ class WaveForecaster(nn.Module):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
+             time_scale: float = 1.0, pred_len: int | None = None,
+             dataset_name: str = "ETTh1") -> dict:
     model.eval()
     total_mse = total_mae = total_n = 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        pred = model(x)                    # [B, P, C]
+        pred = model(x, time_scale=time_scale, pred_len=pred_len,
+                     dataset_name=dataset_name)                    # [B, P, C]
+        if pred_len is not None:
+            y = y[:, :pred_len, :]                                 # match horizon
         mse  = ((pred - y) ** 2).mean().item()
         mae  = (pred - y).abs().mean().item()
         total_mse += mse * x.shape[0]
@@ -955,43 +1005,92 @@ def _dummy_generation() -> None:  # kept so the rest of this placeholder block i
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(dataset_name: str = DATASET,
+def train(datasets: list[str] | None = None,
           context_len: int = CONTEXT_LEN,
-          pred_len:    int = PRED_LEN,
           checkpoint_prefix: str = "wave_ts"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    train_ds = ETTDataset(dataset_name, "train", context_len, pred_len)
-    # Pass training scaler to val/test — benchmark-correct: no leakage
-    val_ds   = ETTDataset(dataset_name, "val",   context_len, pred_len,
-                          mean=train_ds.mean_, std=train_ds.std_)
-    test_ds  = ETTDataset(dataset_name, "test",  context_len, pred_len,
-                          mean=train_ds.mean_, std=train_ds.std_)
-    print(f"Dataset: {dataset_name}  context={context_len}  pred={pred_len}")
-    print(f"  train={len(train_ds)}  val={len(val_ds)}  test={len(test_ds)} windows")
+    if datasets is None:
+        datasets = ["ETTh1", "ETTh2"]
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=True,
-                              persistent_workers=(NUM_WORKERS > 0))
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=NUM_WORKERS, pin_memory=True,
-                              persistent_workers=(NUM_WORKERS > 0))
-    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=NUM_WORKERS, pin_memory=True,
-                              persistent_workers=(NUM_WORKERS > 0))
+    # ── Build datasets: train with MAX_PRED, eval per pred_len ──────────
+    all_train, all_val, all_test = {}, {}, {}
+    for ds in datasets:
+        all_train[ds] = ETTDataset(ds, "train", context_len, MAX_PRED)
+        all_val[ds]   = {}
+        all_test[ds]  = {}
+        for pl in PRED_LENS:
+            all_val[ds][pl]  = ETTDataset(ds, "val",  context_len, pl,
+                                          mean=all_train[ds].mean_,
+                                          std=all_train[ds].std_)
+            all_test[ds][pl] = ETTDataset(ds, "test", context_len, pl,
+                                          mean=all_train[ds].mean_,
+                                          std=all_train[ds].std_)
 
-    n_channels = train_ds.data.shape[1]
+    # Print dataset info
+    for ds in datasets:
+        ts = TIME_SCALES[ds]
+        n  = len(all_train[ds])
+        print(f"  {ds}  time_scale={ts}  train={n} windows")
+
+    train_loaders = {
+        ds: DataLoader(all_train[ds], batch_size=BATCH_SIZE, shuffle=True,
+                       num_workers=NUM_WORKERS, pin_memory=True,
+                       persistent_workers=(NUM_WORKERS > 0))
+        for ds in datasets
+    }
+    val_loaders = {
+        ds: {
+            pl: DataLoader(all_val[ds][pl], batch_size=BATCH_SIZE, shuffle=False,
+                           num_workers=0, pin_memory=True)
+            for pl in PRED_LENS
+        }
+        for ds in datasets
+    }
+    test_loaders = {
+        ds: {
+            pl: DataLoader(all_test[ds][pl], batch_size=BATCH_SIZE, shuffle=False,
+                           num_workers=0, pin_memory=True)
+            for pl in PRED_LENS
+        }
+        for ds in datasets
+    }
+
+    n_channels = all_train[datasets[0]].data.shape[1]
     model  = WaveForecaster(n_channels=n_channels, dim=DIM, depth=DEPTH,
-                            pred_len=pred_len, use_checkpoint=True).to(device)
+                            dataset_names=datasets,
+                            use_checkpoint=True).to(device)
     params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {params:,}  ({params/1e6:.3f}M)")
 
-    # Checkpoint restore
-    checkpoints = sorted(glob.glob(f"{checkpoint_prefix}_epoch*.pt"))
-    start_epoch = 0
+    # dt params need higher LR (shared encoder + per-dataset adapters)
+    dt_params = [op.dt for op in model.operators] + \
+                [op.dt_scout for op in model.operators] + \
+                [op.dt for op in model.adapters.values()] + \
+                [op.dt_scout for op in model.adapters.values()]
+    dt_id_set = {id(p) for p in dt_params}
+    base_params = [p for p in model.parameters()
+                   if id(p) not in dt_id_set and p.requires_grad]
+    opt = optim.AdamW([
+        {'params': base_params, 'lr': BASE_LR,      'weight_decay': WEIGHT_DECAY},
+        {'params': dt_params,   'lr': BASE_LR * 10, 'weight_decay': 0.0},
+    ], eps=1e-8)
+    # Cosine decay over MAX_STEPS — smooth, no epoch-boundary LR jumps.
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=MAX_STEPS, eta_min=BASE_LR * 0.01
+    )
+
+    best_avg_mse   = float('inf')
+    best_step      = 0
+    ema_loss       = None
+    inf_iters      = {ds: cycle(train_loaders[ds]) for ds in datasets}
+
+    # Restore from latest step checkpoint if present
+    checkpoints = sorted(glob.glob(f"{checkpoint_prefix}_step*.pt"))
+    start_step  = 0
     if checkpoints:
         latest = checkpoints[-1]
         print(f"Loading checkpoint: {latest}")
@@ -1000,151 +1099,166 @@ def train(dataset_name: str = DATASET,
                 torch.load(latest, map_location=device), strict=False)
             if missing:    print(f"  New params: {missing}")
             if unexpected: print(f"  Dropped:    {unexpected}")
-            start_epoch = int(latest.split("epoch")[1].split(".")[0]) + 1
-            print(f"Resuming from epoch {start_epoch}")
+            start_step = int(latest.split("step")[1].split(".")[0]) + 1
+            print(f"Resuming from step {start_step}")
         except Exception as e:
             print(f"Load failed ({e}). Starting fresh.")
 
-    # dt params need higher LR — same logic as language model
-    dt_params = [op.dt for op in model.operators] + \
-                [op.dt_scout for op in model.operators]
-    dt_id_set = {id(p) for p in dt_params}
-    base_params = [p for p in model.parameters()
-                   if id(p) not in dt_id_set and p.requires_grad]
-    opt = optim.AdamW([
-        {'params': base_params, 'lr': BASE_LR,      'weight_decay': WEIGHT_DECAY},
-        {'params': dt_params,   'lr': BASE_LR * 10, 'weight_decay': 0.0},
-    ], eps=1e-8)
-    # Softer decay: 0.7× per epoch.  The 0.5× schedule was designed for
-    # near-linear models (DLinear/PatchTST) that converge in 3-4 epochs.
-    # Our deeply nonlinear SSM (fractal maps, Born rule, complex phase)
-    # needs more gradient time to crystallize its basin boundaries.
-    scheduler = optim.lr_scheduler.LambdaLR(
-        opt, lr_lambda=lambda epoch: 0.7 ** epoch
-    )
-
-    best_val_mse = float('inf')
-    patience_counter = 0
-    step = 0
-
+    model.train()
     try:
-        for epoch in range(start_epoch, MAX_EPOCHS):
-            model.train()
-            ema_loss = None   # EMA of training MSE
-            for x, y in train_loader:
-                x, y = x.to(device), y.to(device)
+        for step in range(start_step, MAX_STEPS):
+            horizon = random.choice(PRED_LENS)
 
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                                    enabled=USE_AMP and device.type == 'cuda'):
-                    pred = model(x)                             # [B, P, C]
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                enabled=USE_AMP and device.type == 'cuda'):
+                # All datasets in one forward pass — shared encoder gets
+                # simultaneous gradients from every dataset each step.
+                loss = torch.tensor(0.0, device=device)
+                for ds_name in datasets:
+                    x, y = next(inf_iters[ds_name])
+                    x, y = x.to(device), y.to(device)
+                    pred = model(x, pred_len=horizon, dataset_name=ds_name)
+                    loss = loss + F.mse_loss(pred, y[:, :horizon, :])
+                loss = loss / len(datasets)
 
-                    # ── Training objective: pure MSE ────────────────────────
-                    # Every SOTA model (DLinear, PatchTST, iTransformer) uses
-                    # MSE only.  Auxiliary losses (Sobolev, spectral) add
-                    # competing gradient signals that hurt a tiny 18K-param model.
-                    loss = F.mse_loss(pred, y)
-
-                    with torch.no_grad():
-                        mae_metric = F.l1_loss(pred.detach(), y)
-
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                opt.step()
-                model.invalidate_A_cache()
-
-                if ema_loss is None: ema_loss = loss.item()
-                ema_loss = 0.95 * ema_loss + 0.05 * loss.item()
-
-                if step % PRINT_EVERY == 0:
-                    val_metrics  = evaluate(model, val_loader, device)
-                    test_metrics = evaluate(model, test_loader, device)
-                    dts = " ".join(f"{op.dt.item():.3f}" for op in model.operators)
-                    lr_now = opt.param_groups[0]['lr']
-                    print(f"Epoch {epoch:02d} Step {step:05d} | "
-                          f"train: {ema_loss:.4f} | "
-                          f"val: {val_metrics['MSE']:.4f} | "
-                          f"test: {test_metrics['MSE']:.4f} | "
-                          f"lr: {lr_now:.2e} | "
-                          f"dt: [{dts}]")
-                step += 1
-
-            # ── Epoch-end validation ────────────────────────────────────────
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            opt.step()
             scheduler.step()
-            val_metrics = evaluate(model, val_loader, device)
+            model.invalidate_A_cache()
 
-            if val_metrics['MSE'] < best_val_mse:
-                best_val_mse = val_metrics['MSE']
-                patience_counter = 0
-                best_path = f"{checkpoint_prefix}_best.pt"
-                torch.save(model.state_dict(), best_path)
-                print(f"  ✓ Best model saved: {best_path}")
-            else:
-                patience_counter += 1
-                print(f"  No improvement ({patience_counter}/{PATIENCE})")
-                if patience_counter >= PATIENCE:
-                    print(f"  Early stopping at epoch {epoch}")
-                    break
+            if ema_loss is None: ema_loss = loss.item()
+            ema_loss = 0.95 * ema_loss + 0.05 * loss.item()
 
-            if (epoch + 1) % CHECKPOINT_EVERY == 0:
-                ckpt_path = f"{checkpoint_prefix}_epoch{epoch:03d}.pt"
+            if step % PRINT_EVERY == 0:
+                ref_ds  = datasets[0]
+                ref_val = evaluate(model, val_loaders[ref_ds][96], device,
+                                   pred_len=96, dataset_name=ref_ds)
+                lr_now  = opt.param_groups[0]['lr']
+                dts = " ".join(f"{op.dt.item():.3f}" for op in model.operators)
+                print(f"Step {step:05d} [all h={horizon}] | "
+                      f"train: {ema_loss:.4f} | "
+                      f"{ref_ds}/96 val: {ref_val['MSE']:.4f} | "
+                      f"lr: {lr_now:.2e} | dt: [{dts}]")
+
+            if step % VAL_EVERY == 0 and step > 0:
+                print(f"\n── Step {step:05d} Validation ──")
+                header = "           " + "".join(f"pred={pl:<6d}" for pl in PRED_LENS)
+                print(header)
+                avg_mse_sum = 0
+                avg_mse_n   = 0
+                for ds_name_v in datasets:
+                    row = f"  {ds_name_v:6s}"
+                    for pl in PRED_LENS:
+                        m = evaluate(model, val_loaders[ds_name_v][pl], device,
+                                     pred_len=pl, dataset_name=ds_name_v)
+                        row += f"  {m['MSE']:.4f}  "
+                        avg_mse_sum += m['MSE']
+                        avg_mse_n   += 1
+                    print(row)
+                avg_mse = avg_mse_sum / avg_mse_n
+                print(f"  Avg val MSE: {avg_mse:.4f}")
+
+                print(f"── Step {step:05d} Test ──")
+                print(header)
+                test_mse_sum = 0
+                test_mse_n   = 0
+                for ds_name_v in datasets:
+                    row = f"  {ds_name_v:6s}"
+                    for pl in PRED_LENS:
+                        m = evaluate(model, test_loaders[ds_name_v][pl], device,
+                                     pred_len=pl, dataset_name=ds_name_v)
+                        row += f"  {m['MSE']:.4f}  "
+                        test_mse_sum += m['MSE']
+                        test_mse_n   += 1
+                    print(row)
+                print(f"  Avg test MSE: {test_mse_sum / test_mse_n:.4f}")
+
+                if avg_mse < best_avg_mse:
+                    best_avg_mse = avg_mse
+                    best_step    = step
+                    best_path    = f"{checkpoint_prefix}_best.pt"
+                    torch.save(model.state_dict(), best_path)
+                    print(f"  ✓ Best  (step {step})")
+                else:
+                    since = step - best_step
+                    print(f"  No improvement for {since} steps (patience={PATIENCE_STEPS})")
+                    if since >= PATIENCE_STEPS:
+                        print(f"  Early stopping at step {step}")
+                        break
+                model.train()
+                print()
+
+            if step % CHECKPOINT_EVERY == 0 and step > 0:
+                ckpt_path = f"{checkpoint_prefix}_step{step:05d}.pt"
                 torch.save(model.state_dict(), ckpt_path)
                 print(f"  Checkpoint: {ckpt_path}")
 
     except KeyboardInterrupt:
-        print(f"\nInterrupted at epoch {epoch} step {step}")
-
-    # ── Final test evaluation ───────────────────────────────────────────────
-    print("\n── Test set evaluation ──")
-    best_path = f"{checkpoint_prefix}_best.pt"
-    if os.path.exists(best_path):
-        model.load_state_dict(torch.load(best_path, map_location=device))
-    test_metrics = evaluate(model, test_loader, device)
-    print(f"TEST  MSE={test_metrics['MSE']:.4f}  MAE={test_metrics['MAE']:.4f}")
+        print(f"\nInterrupted at step {step}")
 
     # ── Benchmark-standard test evaluation ──────────────────────────────────
-    # Standard ETT splits use fixed month boundaries (Informer/PatchTST/DLinear):
-    #   ETTh: train=8640, val=2880, test=2880  (rows 11520-14400)
-    # Scaler must also be fitted on the STANDARD train (rows 0-8640), not ours.
-    # This is the only way to get numbers directly comparable to published tables.
+    # After resampling ETTm to hourly, all datasets have the same split sizes.
     BENCH_SPLITS = {"ETTh1": (8640, 2880, 2880), "ETTh2": (8640, 2880, 2880),
-                    "ETTm1": (34560, 11520, 11520), "ETTm2": (34560, 11520, 11520)}
-    if dataset_name in BENCH_SPLITS:
-        n_tr_b, n_val_b, n_test_b = BENCH_SPLITS[dataset_name]
-        path = prepare_ett_dataset(dataset_name)
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
-        raw_data = df.values.astype(np.float32)
-        # Standard scaler: fitted on rows 0-n_tr_b (NOT our larger train set)
-        bench_mean = raw_data[:n_tr_b].mean(axis=0, keepdims=True)
-        bench_std  = raw_data[:n_tr_b].std(axis=0, keepdims=True) + 1e-8
-        bench_raw  = raw_data[n_tr_b + n_val_b - context_len : n_tr_b + n_val_b + n_test_b]
-        bench_test = ETTDataset.__new__(ETTDataset)
-        bench_test.data        = (bench_raw - bench_mean) / bench_std
-        bench_test.mean_       = bench_mean
-        bench_test.std_        = bench_std
-        bench_test.context_len = context_len
-        bench_test.pred_len    = pred_len
-        bench_test.window      = context_len + pred_len
-        bench_test.n_samples   = max(0, len(bench_test.data) - bench_test.window + 1)
-        bench_loader = DataLoader(bench_test, batch_size=BATCH_SIZE, shuffle=False,
-                                  num_workers=0, pin_memory=True)
-        bench_metrics = evaluate(model, bench_loader, device)
-        print(f"\n── Benchmark-standard test (rows {n_tr_b+n_val_b}-{n_tr_b+n_val_b+n_test_b}) ──")
-        print(f"BENCH MSE={bench_metrics['MSE']:.4f}  MAE={bench_metrics['MAE']:.4f}")
-        print(f"  (scaler fitted on rows 0-{n_tr_b}, matching PatchTST/DLinear/iTransformer)")
+                    "ETTm1": (8640, 2880, 2880), "ETTm2": (8640, 2880, 2880)}
+    try:
+        print("\n── Benchmark-standard test ──")
+        best_path = f"{checkpoint_prefix}_best.pt"
+        if os.path.exists(best_path):
+            model.load_state_dict(torch.load(best_path, map_location=device))
+        header = "           " + "".join(f"pred={pl:<6d}" for pl in PRED_LENS)
+        print(header)
+        for ds_name in datasets:
+            if ds_name not in BENCH_SPLITS:
+                continue
+            n_tr_b, n_val_b, n_test_b = BENCH_SPLITS[ds_name]
+            path = prepare_ett_dataset(ds_name)
+            df = pd.read_csv(path, index_col=0, parse_dates=True)
+            raw_data = df.values.astype(np.float32)
+            # Resample ETTm to hourly (same as training)
+            if ds_name.startswith("ETTm"):
+                T_orig = len(raw_data)
+                T_trim = (T_orig // 4) * 4
+                raw_data = raw_data[:T_trim].reshape(-1, 4, raw_data.shape[1]).mean(axis=1)
+            bench_mean = raw_data[:n_tr_b].mean(axis=0, keepdims=True)
+            bench_std  = raw_data[:n_tr_b].std(axis=0, keepdims=True) + 1e-8
+            bench_raw  = raw_data[n_tr_b + n_val_b - context_len :
+                                  n_tr_b + n_val_b + n_test_b]
+            row = f"  {ds_name:6s}"
+            for pl in PRED_LENS:
+                bench_ds = ETTDataset.__new__(ETTDataset)
+                bench_ds.data        = (bench_raw - bench_mean) / bench_std
+                bench_ds.mean_       = bench_mean
+                bench_ds.std_        = bench_std
+                bench_ds.context_len = context_len
+                bench_ds.pred_len    = pl
+                bench_ds.window      = context_len + pl
+                bench_ds.n_samples   = max(0, len(bench_ds.data) - bench_ds.window + 1)
+                bl = DataLoader(bench_ds, batch_size=BATCH_SIZE, shuffle=False,
+                                num_workers=0, pin_memory=True)
+                m = evaluate(model, bl, device, pred_len=pl,
+                             dataset_name=ds_name)
+                row += f"  {m['MSE']:.4f}  "
+            print(row)
+        print(f"  (scaler fitted on standard train rows, matching PatchTST/DLinear)")
+    except (KeyboardInterrupt, RuntimeError) as e:
+        print(f"  (bench eval skipped: {e})")
 
     print(f"\nParams: {params:,}  ({params/1e6:.3f}M)")
-    print(f"Dataset: {dataset_name}  context={context_len}  pred={pred_len}")
-    return test_metrics
+    print(f"Datasets: {', '.join(datasets)}  context={context_len}")
 
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset",  default=DATASET,      choices=list(ETT_URLS))
+    p.add_argument("--dataset",  default=None,
+                   choices=list(ETT_URLS) + ["all"],
+                   help="Single dataset or 'all' for multi-dataset training")
     p.add_argument("--context",  type=int, default=CONTEXT_LEN)
-    p.add_argument("--pred_len", type=int, default=PRED_LEN,
-                   choices=[96, 192, 336, 720])
     args = p.parse_args()
-    train(args.dataset, args.context, args.pred_len)
+    if args.dataset is None or args.dataset == "all":
+        train(datasets=None, context_len=args.context)
+    else:
+        train(datasets=[args.dataset], context_len=args.context)
