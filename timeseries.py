@@ -1057,13 +1057,14 @@ def train(dataset_name: str = DATASET,
                 ema_loss = 0.95 * ema_loss + 0.05 * loss.item()
 
                 if step % PRINT_EVERY == 0:
-                    val_metrics = evaluate(model, val_loader, device)
+                    val_metrics  = evaluate(model, val_loader, device)
+                    test_metrics = evaluate(model, test_loader, device)
                     dts = " ".join(f"{op.dt.item():.3f}" for op in model.operators)
                     lr_now = opt.param_groups[0]['lr']
                     print(f"Epoch {epoch:02d} Step {step:05d} | "
                           f"train: {ema_loss:.4f} | "
                           f"val: {val_metrics['MSE']:.4f} | "
-                          f"MAE: {mae_metric.item():.4f} | "
+                          f"test: {test_metrics['MSE']:.4f} | "
                           f"lr: {lr_now:.2e} | "
                           f"dt: [{dts}]")
                 step += 1
@@ -1100,6 +1101,38 @@ def train(dataset_name: str = DATASET,
         model.load_state_dict(torch.load(best_path, map_location=device))
     test_metrics = evaluate(model, test_loader, device)
     print(f"TEST  MSE={test_metrics['MSE']:.4f}  MAE={test_metrics['MAE']:.4f}")
+
+    # ── Benchmark-standard test evaluation ──────────────────────────────────
+    # Standard ETT splits use fixed month boundaries (Informer/PatchTST/DLinear):
+    #   ETTh: train=8640, val=2880, test=2880  (rows 11520-14400)
+    # Scaler must also be fitted on the STANDARD train (rows 0-8640), not ours.
+    # This is the only way to get numbers directly comparable to published tables.
+    BENCH_SPLITS = {"ETTh1": (8640, 2880, 2880), "ETTh2": (8640, 2880, 2880),
+                    "ETTm1": (34560, 11520, 11520), "ETTm2": (34560, 11520, 11520)}
+    if dataset_name in BENCH_SPLITS:
+        n_tr_b, n_val_b, n_test_b = BENCH_SPLITS[dataset_name]
+        path = prepare_ett_dataset(dataset_name)
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        raw_data = df.values.astype(np.float32)
+        # Standard scaler: fitted on rows 0-n_tr_b (NOT our larger train set)
+        bench_mean = raw_data[:n_tr_b].mean(axis=0, keepdims=True)
+        bench_std  = raw_data[:n_tr_b].std(axis=0, keepdims=True) + 1e-8
+        bench_raw  = raw_data[n_tr_b + n_val_b - context_len : n_tr_b + n_val_b + n_test_b]
+        bench_test = ETTDataset.__new__(ETTDataset)
+        bench_test.data        = (bench_raw - bench_mean) / bench_std
+        bench_test.mean_       = bench_mean
+        bench_test.std_        = bench_std
+        bench_test.context_len = context_len
+        bench_test.pred_len    = pred_len
+        bench_test.window      = context_len + pred_len
+        bench_test.n_samples   = max(0, len(bench_test.data) - bench_test.window + 1)
+        bench_loader = DataLoader(bench_test, batch_size=BATCH_SIZE, shuffle=False,
+                                  num_workers=0, pin_memory=True)
+        bench_metrics = evaluate(model, bench_loader, device)
+        print(f"\n── Benchmark-standard test (rows {n_tr_b+n_val_b}-{n_tr_b+n_val_b+n_test_b}) ──")
+        print(f"BENCH MSE={bench_metrics['MSE']:.4f}  MAE={bench_metrics['MAE']:.4f}")
+        print(f"  (scaler fitted on rows 0-{n_tr_b}, matching PatchTST/DLinear/iTransformer)")
+
     print(f"\nParams: {params:,}  ({params/1e6:.3f}M)")
     print(f"Dataset: {dataset_name}  context={context_len}  pred={pred_len}")
     return test_metrics
